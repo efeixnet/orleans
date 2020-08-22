@@ -11,7 +11,6 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Orleans.Configuration;
 using Orleans.Hosting;
-using Orleans.Networking.Shared;
 using Orleans.Runtime;
 using Orleans.Runtime.Configuration;
 using Orleans.Runtime.Messaging;
@@ -46,18 +45,18 @@ namespace Orleans.Messaging
     // </summary>
     internal class ClientMessageCenter : IMessageCenter, IDisposable
     {
+        private readonly object grainBucketUpdateLock = new object();
         internal readonly SerializationManager SerializationManager;
 
         internal static readonly TimeSpan MINIMUM_INTERCONNECT_DELAY = TimeSpan.FromMilliseconds(100);   // wait one tenth of a second between connect attempts
         internal const int CONNECT_RETRY_COUNT = 2;                                                      // Retry twice before giving up on a gateway server
 
-        internal GrainId ClientId { get; private set; }
+        internal ClientGrainId ClientId { get; private set; }
         public IRuntimeClient RuntimeClient { get; }
         internal bool Running { get; private set; }
 
         private readonly GatewayManager gatewayManager;
-        internal readonly Channel<Message> PendingInboundMessages;
-        private readonly Action<Message>[] messageHandlers;
+        private Action<Message> messageHandler;
         private int numMessages;
         // The grainBuckets array is used to select the connection to use when sending an ordered message to a grain.
         // Requests are bucketed by GrainID, so that all requests to a grain get routed through the same bucket.
@@ -78,7 +77,7 @@ namespace Orleans.Messaging
             IOptions<ClientMessagingOptions> clientMessagingOptions,
             IPAddress localAddress,
             int gen,
-            GrainId clientId,
+            ClientGrainId clientId,
             SerializationManager serializationManager,
             IRuntimeClient runtimeClient,
             MessageFactory messageFactory,
@@ -88,7 +87,6 @@ namespace Orleans.Messaging
             ConnectionManager connectionManager,
             GatewayManager gatewayManager)
         {
-            this.messageHandlers = new Action<Message>[Enum.GetValues(typeof(Message.Categories)).Length];
             this.connectionManager = connectionManager;
             this.SerializationManager = serializationManager;
             MyAddress = SiloAddress.New(new IPEndPoint(localAddress, 0), gen);
@@ -98,12 +96,6 @@ namespace Orleans.Messaging
             this.connectionStatusListener = connectionStatusListener;
             Running = false;
             this.gatewayManager = gatewayManager;
-            PendingInboundMessages = Channel.CreateUnbounded<Message>(new UnboundedChannelOptions
-            {
-                SingleReader = true,
-                SingleWriter = false,
-                AllowSynchronousContinuations = false
-            });
             numMessages = 0;
             this.grainBuckets = new WeakReference<Connection>[clientMessagingOptions.Value.ClientSenderBuckets];
             logger = loggerFactory.CreateLogger<ClientMessageCenter>();
@@ -135,11 +127,6 @@ namespace Orleans.Messaging
         {
             Running = false;
 
-            Utils.SafeExecute(() =>
-            {
-                PendingInboundMessages.Writer.TryComplete();
-            });
-
             if (this.statisticsLevel.CollectQueueStats())
             {
                 queueTracking.OnStopExecution();
@@ -147,22 +134,19 @@ namespace Orleans.Messaging
             gatewayManager.Stop();
         }
 
-        public ChannelReader<Message> GetReader(Message.Categories type) => PendingInboundMessages.Reader;
-
         public void OnReceivedMessage(Message message)
         {
-            var handler = this.messageHandlers[(int)message.Category];
-            if (handler != null)
+            var handler = this.messageHandler;
+            if (handler is null)
             {
-                handler(message);
+                ThrowNullMessageHandler();
             }
             else
             {
-                if (!PendingInboundMessages.Writer.TryWrite(message))
-                {
-                    this.logger.LogWarning($"{nameof(ClientMessageCenter)} dropping message {message} because inbound queue is closed.");
-                }
+                handler(message);
             }
+
+            static void ThrowNullMessageHandler() => throw new InvalidOperationException("MessageCenter does not have a message handler set");
         }
 
         public void SendMessage(Message msg)
@@ -187,7 +171,7 @@ namespace Orleans.Messaging
                         ErrorCode.ProxyClient_QueueRequest,
                         "Sending message {0} via gateway {1}",
                         msg,
-                        connection.RemoteEndpoint);
+                        connection.RemoteEndPoint);
                 }
             }
             else
@@ -199,6 +183,8 @@ namespace Orleans.Messaging
                     try
                     {
                         var connection = await task;
+
+                        // If the connection returned is null then the message was already rejected due to a failure.
                         if (connection is null) return;
 
                         connection.Send(message);
@@ -209,12 +195,26 @@ namespace Orleans.Messaging
                                 ErrorCode.ProxyClient_QueueRequest,
                                 "Sending message {0} via gateway {1}",
                                 message,
-                                connection.RemoteEndpoint);
+                                connection.RemoteEndPoint);
                         }
                     }
-                    catch
+                    catch (Exception exception)
                     {
-                        this.SendMessage(message);
+                        if (message.RetryCount < MessagingOptions.DEFAULT_MAX_MESSAGE_SEND_RETRIES)
+                        {
+                            ++message.RetryCount;
+
+                            _ = Task.Factory.StartNew(
+                                state => this.SendMessage((Message)state),
+                                message,
+                                CancellationToken.None,
+                                TaskCreationOptions.DenyChildAttach,
+                                TaskScheduler.Default);
+                        }
+                        else
+                        {
+                            this.RejectMessage(message, $"Unable to send message due to exception {exception}", exception);
+                        }
                     }
                 }
             }
@@ -223,16 +223,17 @@ namespace Orleans.Messaging
         private ValueTask<Connection> GetGatewayConnection(Message msg)
         {
             // If there's a specific gateway specified, use it
-            if (msg.TargetSilo != null && gatewayManager.GetLiveGateways().Contains(msg.TargetSilo))
+            if (msg.TargetSilo != null && gatewayManager.IsGatewayAvailable(msg.TargetSilo))
             {
-                var connectionTask = this.connectionManager.GetConnection(msg.TargetSilo);
+                var siloAddress = SiloAddress.New(msg.TargetSilo.Endpoint, 0);
+                var connectionTask = this.connectionManager.GetConnection(siloAddress);
                 if (connectionTask.IsCompletedSuccessfully) return connectionTask;
 
                 return ConnectAsync(msg.TargetSilo, connectionTask, msg, directGatewayMessage: true);
             }
 
             // For untargeted messages to system targets, and for unordered messages, pick a next connection in round robin fashion.
-            if (msg.TargetGrain.IsSystemTarget || msg.IsUnordered)
+            if (msg.TargetGrain.IsSystemTarget() || msg.IsUnordered)
             {
                 // Get the cached list of live gateways.
                 // Pick a next gateway name in a round robin fashion.
@@ -259,7 +260,7 @@ namespace Orleans.Messaging
             }
 
             // Otherwise, use the buckets to ensure ordering.
-            var index = msg.TargetGrain.GetHashCode_Modulo((uint)grainBuckets.Length);
+            var index = GetHashCodeModulo(msg.TargetGrain.GetHashCode(), (uint)grainBuckets.Length);
 
             // Repeated from above, at the declaration of the grainBuckets array:
             // Requests are bucketed by GrainID, so that all requests to a grain get routed through the same bucket.
@@ -268,7 +269,10 @@ namespace Orleans.Messaging
             // false, then a new gateway is selected using the gateway manager, and a new connection established if necessary.
             WeakReference<Connection> weakRef = grainBuckets[index];
 
-            if (weakRef != null && weakRef.TryGetTarget(out var existingConnection) && existingConnection.IsValid)
+            if (weakRef != null
+                && weakRef.TryGetTarget(out var existingConnection)
+                && existingConnection.IsValid
+                && gatewayManager.IsGatewayAvailable(msg.TargetSilo))
             {
                 return new ValueTask<Connection>(existingConnection);
             }
@@ -293,32 +297,28 @@ namespace Orleans.Messaging
             var gatewayConnection = this.connectionManager.GetConnection(addr);
             if (gatewayConnection.IsCompletedSuccessfully)
             {
-                var result = this.TryUpdateConnection(index, gatewayConnection.Result, weakRef);
-                if (result == null) return this.GetGatewayConnection(msg);
-                return new ValueTask<Connection>(result);
+                this.UpdateBucket(index, gatewayConnection.Result);
+                return gatewayConnection;
             }
 
-            return AddToBucketAsync(index, msg, gatewayConnection, weakRef, addr);
+            return AddToBucketAsync(index, gatewayConnection, addr);
 
             async ValueTask<Connection> AddToBucketAsync(
-                uint i,
-                Message message,
-                ValueTask<Connection> c,
-                WeakReference<Connection> existing,
+                uint bucketIndex,
+                ValueTask<Connection> connectionTask,
                 SiloAddress gatewayAddress)
             {
                 try
                 {
-                    var connection = await c;
-
-                    var result = this.TryUpdateConnection(i, connection, existing);
-                    if (result == null) return await this.GetGatewayConnection(message);
-                    return result;
+                    var connection = await connectionTask.ConfigureAwait(false);
+                    this.UpdateBucket(bucketIndex, connection);
+                    return connection;
                 }
-                catch (Exception)
+                catch
                 {
                     this.gatewayManager.MarkAsDead(gatewayAddress);
-                    return await this.GetGatewayConnection(message);
+                    this.UpdateBucket(bucketIndex, null);
+                    throw;
                 }
             }
 
@@ -343,48 +343,29 @@ namespace Orleans.Messaging
                     if (result is null) this.gatewayManager.MarkAsDead(gateway);
                 }
             }
-        }
 
-        private Connection TryUpdateConnection(uint index, Connection connection, WeakReference<Connection> existing)
-        {
-            WeakReference<Connection> result;
-            var replacement = new WeakReference<Connection>(connection);
-            var newWeakRef = Interlocked.CompareExchange(ref grainBuckets[index], replacement, existing);
-            if (newWeakRef == existing)
-            {
-                result = replacement;
-            }
-            else
-            {
-                result = newWeakRef;
-            }
 
-            if (result != null && result.TryGetTarget(out var existingConnection))
+            static uint GetHashCodeModulo(int key, uint umod)
             {
-                return existingConnection;
-            }
-            else
-            {
-                // If the reference has expired, retry with this non-expired reference.
-                return this.TryUpdateConnection(index, connection, result);
+                int mod = (int)umod;
+                key = ((key % mod) + mod) % mod; // key should be positive now. So assert with checked.
+                return checked((uint)key);
             }
         }
 
-        public Task<IGrainTypeResolver> GetGrainTypeResolver(IInternalGrainFactory grainFactory)
+        private void UpdateBucket(uint index, Connection connection)
         {
-            var silo = GetLiveGatewaySiloAddress();
-            return GetTypeManager(silo, grainFactory).GetClusterGrainTypeResolver();
+            lock (this.grainBucketUpdateLock)
+            {
+                var value = this.grainBuckets[index] ?? new WeakReference<Connection>(connection);
+                value.SetTarget(connection);
+                this.grainBuckets[index] = value;
+            }
         }
 
-        public Task<Streams.ImplicitStreamSubscriberTable> GetImplicitStreamSubscriberTable(IInternalGrainFactory grainFactory)
+        public void RegisterLocalMessageHandler(Action<Message> handler)
         {
-            var silo = GetLiveGatewaySiloAddress();
-            return GetTypeManager(silo, grainFactory).GetImplicitStreamSubscriberTable(silo);
-        }
-
-        public void RegisterLocalMessageHandler(Message.Categories category, Action<Message> handler)
-        {
-            this.messageHandlers[(int)category] = handler;
+            this.messageHandler = handler;
         }
 
         public void RejectMessage(Message msg, string reason, Exception exc = null)
@@ -409,16 +390,6 @@ namespace Orleans.Messaging
             get { return 0; }
         }
 
-        public int ReceiveQueueLength
-        {
-            get { return 0; }
-        }
-
-        private IClusterTypeManager GetTypeManager(SiloAddress destination, IInternalGrainFactory grainFactory)
-        {
-            return grainFactory.GetSystemTarget<IClusterTypeManager>(Constants.TypeManagerId, destination);
-        }
-
         private SiloAddress GetLiveGatewaySiloAddress()
         {
             var gateway = gatewayManager.GetLiveGateway();
@@ -429,17 +400,6 @@ namespace Orleans.Messaging
             }
 
             return gateway;
-        }
-
-        internal void UpdateClientId(GrainId clientId)
-        {
-            if (ClientId.Category != UniqueKey.Category.Client)
-                throw new InvalidOperationException("Only handshake client ID can be updated with a cluster ID.");
-
-            if (clientId.Category != UniqueKey.Category.GeoClient)
-                throw new ArgumentException("Handshake client ID can only be updated  with a geo client.", nameof(clientId));
-
-            ClientId = clientId;
         }
 
         internal void OnGatewayConnectionOpen()
@@ -461,7 +421,6 @@ namespace Orleans.Messaging
 
         public void Dispose()
         {
-            PendingInboundMessages.Writer.TryComplete();
             gatewayManager.Dispose();
         }
     }

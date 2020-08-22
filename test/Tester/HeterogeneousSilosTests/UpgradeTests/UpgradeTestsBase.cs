@@ -1,3 +1,4 @@
+#if !NETCOREAPP
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -85,7 +86,13 @@ namespace Tester.HeterogeneousSilosTests.UpgradeTests
                 throw new InvalidOperationException($"Number of directories found for pattern: '{BuildConfiguration}' under {testDirectory.FullName}: {directories.Length}");
             }
 
-            var files = Directory.GetFiles(directories[0], VersionTestBinaryName, SearchOption.AllDirectories);
+            var files = Directory.GetFiles(directories[0], VersionTestBinaryName, SearchOption.AllDirectories)
+#if NETCOREAPP
+                .Where(f => f.Contains("netcoreapp"))
+#else
+                .Where(f => !f.Contains("netcoreapp"))
+#endif
+                .ToArray();
 
             if (files.Length != 1)
             {
@@ -147,6 +154,7 @@ namespace Tester.HeterogeneousSilosTests.UpgradeTests
             // New activation should be V2
             var grain1 = Client.GetGrain<IVersionUpgradeTestGrain>(1);
             Assert.Equal(2, await grain1.GetVersion());
+            Assert.Equal(1, await grain0.GetVersion());
 
             Assert.Equal(expectedVersion, await grain1.ProxyGetVersion(grain0));
             Assert.Equal(expectedVersion, await grain0.GetVersion());
@@ -246,15 +254,22 @@ namespace Tester.HeterogeneousSilosTests.UpgradeTests
 
         public void Dispose()
         {
-            if (!deployedSilos.Any()) return;
-
-            var primarySilo = this.deployedSilos[0];
-            foreach (var silo in this.deployedSilos.Skip(1))
+            try
             {
-                silo.Dispose();
+                if (!deployedSilos.Any()) return;
+
+                var primarySilo = this.deployedSilos[0];
+                foreach (var silo in this.deployedSilos.Skip(1))
+                {
+                    silo.Dispose();
+                }
+                primarySilo.Dispose();
+                this.Client?.Dispose();
             }
-            primarySilo.Dispose();
-            this.Client?.Dispose();
+            finally
+            {
+                this.cluster?.Dispose();
+            }
         }
 
         public Task InitializeAsync()
@@ -278,3 +293,4 @@ namespace Tester.HeterogeneousSilosTests.UpgradeTests
         }
     }
 }
+#endif

@@ -1,8 +1,6 @@
-using System;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
 using Orleans;
-using Orleans.Configuration;
 using Orleans.Hosting;
 using Orleans.TestingHost;
 using TestExtensions;
@@ -25,9 +23,9 @@ namespace UnitTests.StreamingTests
                 builder.AddClientBuilderConfigurator<ClientConfiguretor>();
             }
 
-            public class SiloConfigurator : ISiloBuilderConfigurator
+            public class SiloConfigurator : ISiloConfigurator
             {
-                public void Configure(ISiloHostBuilder hostBuilder)
+                public void Configure(ISiloBuilder hostBuilder)
                 {
                     hostBuilder.AddSimpleMessageStreamProvider(SmsStreamProviderName)
                         .AddSimpleMessageStreamProvider("SMSProviderDoNotOptimizeForImmutableData",

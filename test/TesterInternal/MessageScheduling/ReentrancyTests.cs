@@ -15,9 +15,9 @@ using Orleans.Configuration;
 
 namespace UnitTests
 {
-    internal class ReentrancyTestsSiloBuilderConfigurator : ISiloBuilderConfigurator
+    internal class ReentrancyTestsSiloBuilderConfigurator : ISiloConfigurator
     {
-        public void Configure(ISiloHostBuilder hostBuilder)
+        public void Configure(ISiloBuilder hostBuilder)
         {
             hostBuilder.AddSimpleMessageStreamProvider("sms")
                 .AddMemoryGrainStorage("MemoryStore")
@@ -36,23 +36,13 @@ namespace UnitTests
             }
         }
 
-        public class SiloConfigurator :ISiloBuilderConfigurator
-        {
-            public void Configure(ISiloHostBuilder hostBuilder)
-            {
-                hostBuilder.Configure<SchedulingOptions>(options => options.AllowCallChainReentrancy = true);
-            }
-        }
-
         private readonly ITestOutputHelper output;
         private readonly Fixture fixture;
-        private readonly TestCluster hostedCluster;
 
         public ReentrancyTests(ITestOutputHelper output, Fixture fixture)
         {
             this.output = output;
             this.fixture = fixture;
-            hostedCluster = fixture.HostedCluster;
         }
 
         // See https://github.com/dotnet/orleans/pull/5086
@@ -132,19 +122,6 @@ namespace UnitTests
         }
         
         [Fact, TestCategory("Functional"), TestCategory("Tasks"), TestCategory("Reentrancy")]
-        public async Task IsReentrant()
-        {
-            IReentrantTestSupportGrain grain = this.fixture.GrainFactory.GetGrain<IReentrantTestSupportGrain>(0);
-
-            var grainFullName = typeof(ReentrantGrain).FullName;
-            Assert.True(await grain.IsReentrant(grainFullName));
-            grainFullName = typeof(NonRentrantGrain).FullName;
-            Assert.False(await grain.IsReentrant(grainFullName));
-            grainFullName = typeof(UnorderedNonRentrantGrain).FullName;
-            Assert.False(await grain.IsReentrant(grainFullName));
-        }
-
-        [Fact, TestCategory("Functional"), TestCategory("Tasks"), TestCategory("Reentrancy")]
         public void Reentrancy_Deadlock_1()
         {
             List<Task> done = new List<Task>();
@@ -208,7 +185,7 @@ namespace UnitTests
             await Do_FanOut_Task_Join(0, false, true);
         }
 
-        // TODO: [Fact, TestCategory("BVT"), TestCategory("Functional"), TestCategory("Tasks"), TestCategory("Reentrancy")]
+        // TODO: [Fact, TestCategory("BVT"), TestCategory("Tasks"), TestCategory("Reentrancy")]
         [Fact(Skip ="Ignore"), TestCategory("Failures"), TestCategory("Tasks"), TestCategory("Reentrancy")]
         public async Task FanOut_Task_NonReentrant_Chain()
         {

@@ -2,42 +2,39 @@ using System;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.AspNetCore.Connections;
 using Microsoft.Extensions.Options;
 using Orleans.Configuration;
 using Orleans.Hosting;
-using Orleans.Networking.Shared;
 
 namespace Orleans.Runtime.Messaging
 {
     internal sealed class SiloConnectionListener : ConnectionListener, ILifecycleParticipant<ISiloLifecycle>
     {
-        private readonly INetworkingTrace trace;
+        internal static readonly object ServicesKey = new object();
         private readonly ILocalSiloDetails localSiloDetails;
-        private readonly ISiloStatusOracle siloStatusOracle;
+        private readonly SiloConnectionOptions siloConnectionOptions;
         private readonly MessageCenter messageCenter;
-        private readonly MessageFactory messageFactory;
         private readonly EndpointOptions endpointOptions;
         private readonly ConnectionManager connectionManager;
+        private readonly ConnectionCommon connectionShared;
 
         public SiloConnectionListener(
             IServiceProvider serviceProvider,
             IOptions<ConnectionOptions> connectionOptions,
-            IConnectionListenerFactory listenerFactory,
+            IOptions<SiloConnectionOptions> siloConnectionOptions,
             MessageCenter messageCenter,
-            MessageFactory messageFactory,
-            INetworkingTrace trace,
             IOptions<EndpointOptions> endpointOptions,
             ILocalSiloDetails localSiloDetails,
-            ISiloStatusOracle siloStatusOracle,
-            ConnectionManager connectionManager)
-            : base(serviceProvider, listenerFactory, connectionOptions, trace)
+            ConnectionManager connectionManager,
+            ConnectionCommon connectionShared)
+            : base(serviceProvider.GetRequiredServiceByKey<object, IConnectionListenerFactory>(ServicesKey), connectionOptions, connectionManager, connectionShared)
         {
+            this.siloConnectionOptions = siloConnectionOptions.Value;
             this.messageCenter = messageCenter;
-            this.messageFactory = messageFactory;
-            this.trace = trace;
             this.localSiloDetails = localSiloDetails;
-            this.siloStatusOracle = siloStatusOracle;
             this.connectionManager = connectionManager;
+            this.connectionShared = connectionShared;
             this.endpointOptions = endpointOptions.Value;
         }
 
@@ -49,21 +46,25 @@ namespace Orleans.Runtime.Messaging
                 default(SiloAddress),
                 context,
                 this.ConnectionDelegate,
-                this.ServiceProvider,
-                this.trace,
                 this.messageCenter,
-                this.messageFactory,
                 this.localSiloDetails,
-                this.siloStatusOracle,
                 this.connectionManager,
-                this.ConnectionOptions);
+                this.ConnectionOptions,
+                this.connectionShared);
+        }
+
+        protected override void ConfigureConnectionBuilder(IConnectionBuilder connectionBuilder)
+        {
+            var configureDelegate = (SiloConnectionOptions.ISiloConnectionBuilderOptions)this.siloConnectionOptions;
+            configureDelegate.ConfigureSiloInboundBuilder(connectionBuilder);
+            base.ConfigureConnectionBuilder(connectionBuilder);
         }
 
         void ILifecycleParticipant<ISiloLifecycle>.Participate(ISiloLifecycle lifecycle)
         {
             if (this.Endpoint is null) return;
 
-            lifecycle.Subscribe(nameof(SiloConnectionListener), ServiceLifecycleStage.RuntimeInitialize, this.OnRuntimeInitializeStart, this.OnRuntimeInitializeStop);
+            lifecycle.Subscribe(nameof(SiloConnectionListener), ServiceLifecycleStage.RuntimeInitialize-1, this.OnRuntimeInitializeStart, this.OnRuntimeInitializeStop);
         }
 
         private async Task OnRuntimeInitializeStart(CancellationToken cancellationToken)

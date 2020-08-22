@@ -1,10 +1,5 @@
 using System;
-using System.Linq;
-using System.Threading;
 using Microsoft.Extensions.Logging;
-using Orleans.Serialization;
-using Microsoft.Extensions.Options;
-using Orleans.Configuration;
 using System.Threading.Tasks;
 
 namespace Orleans.Runtime.Messaging
@@ -14,6 +9,8 @@ namespace Orleans.Runtime.Messaging
     {
         private readonly MessageCenter messageCenter;
         private readonly ConnectionManager connectionManager;
+        private readonly ISiloStatusOracle siloStatusOracle;
+        private readonly MessagingTrace messagingTrace;
         private readonly ILogger logger;
         private bool stopped;
 
@@ -33,85 +30,103 @@ namespace Orleans.Runtime.Messaging
         internal OutboundMessageQueue(
             MessageCenter mc,
             ILogger<OutboundMessageQueue> logger,
-            ConnectionManager senderManager)
+            ConnectionManager senderManager,
+            ISiloStatusOracle siloStatusOracle,
+            MessagingTrace messagingTrace)
         {
             messageCenter = mc;
             this.connectionManager = senderManager;
+            this.siloStatusOracle = siloStatusOracle;
+            this.messagingTrace = messagingTrace;
             this.logger = logger;
             stopped = false;
         }
 
         public void SendMessage(Message msg)
         {
-            if (msg == null) throw new ArgumentNullException("msg", "Can't send a null message.");
+            if (msg is null) throw new ArgumentNullException("msg", "Can't send a null message.");
 
             if (stopped)
             {
-                logger.Info(ErrorCode.Runtime_Error_100112, "Message was queued for sending after outbound queue was stopped: {0}", msg);
+                logger.LogInformation((int)ErrorCode.Runtime_Error_100115, "Message was queued for sending after outbound queue was stopped: {Message}", msg);
+                messageCenter.SendRejection(msg, Message.RejectionTypes.Unrecoverable, "Message was queued for sending after outbound queue was stopped");
                 return;
             }
 
             // Don't process messages that have already timed out
             if (msg.IsExpired)
             {
-                msg.DropExpiredMessage(MessagingStatisticsGroup.Phase.Send);
+                this.messagingTrace.OnDropExpiredMessage(msg, MessagingStatisticsGroup.Phase.Send);
                 return;
             }
 
-            if (!msg.QueuedTime.HasValue)
-            {
-                msg.QueuedTime = DateTime.UtcNow;
-            }
-
             // First check to see if it's really destined for a proxied client, instead of a local grain.
-            if (messageCenter.IsProxying && messageCenter.TryDeliverToProxy(msg))
+            if (messageCenter.TryDeliverToProxy(msg))
             {
+                // Message was successfully delivered to the proxy.
                 return;
             }
 
             if (msg.TargetSilo == null)
             {
-                logger.Error(ErrorCode.Runtime_Error_100113, "Message does not have a target silo: " + msg + " -- Call stack is: " + Utils.GetStackTrace());
+                logger.LogError((int)ErrorCode.Runtime_Error_100113, "Message does not have a target silo: " + msg + " -- Call stack is: " + Utils.GetStackTrace());
                 messageCenter.SendRejection(msg, Message.RejectionTypes.Unrecoverable, "Message to be sent does not have a target silo");
                 return;
             }
 
+            messagingTrace.OnSendMessage(msg);
             if (!messageCenter.TrySendLocal(msg))
             {
                 if (stopped)
                 {
-                    logger.Info(ErrorCode.Runtime_Error_100115, "Message was queued for sending after outbound queue was stopped: {0}", msg);
+                    logger.LogInformation((int)ErrorCode.Runtime_Error_100115, "Message was queued for sending after outbound queue was stopped: {Message}", msg);
+                    messageCenter.SendRejection(msg, Message.RejectionTypes.Unrecoverable, "Message was queued for sending after outbound queue was stopped");
                     return;
                 }
 
                 // check for simulation of lost messages
                 if (messageCenter.ShouldDrop?.Invoke(msg) == true)
                 {
-                    logger.Info(ErrorCode.Messaging_SimulatedMessageLoss, "Message blocked by test");
+                    logger.LogInformation((int)ErrorCode.Messaging_SimulatedMessageLoss, "Message blocked by test");
                     messageCenter.SendRejection(msg, Message.RejectionTypes.Unrecoverable, "Message blocked by test");
                     return;
                 }
 
-                var senderTask = this.connectionManager.GetConnection(msg.TargetSilo);
-                if (senderTask.IsCompletedSuccessfully)
+                if (this.connectionManager.TryGetConnection(msg.TargetSilo, out var existingConnection))
                 {
-                    var sender = senderTask.Result;
-                    sender.Send(msg);
+                    existingConnection.Send(msg);
+                    return;
+                }
+                else if (this.siloStatusOracle.IsDeadSilo(msg.TargetSilo))
+                {
+                    // Do not try to establish 
+                    this.messagingTrace.OnRejectSendMessageToDeadSilo(this.messageCenter.MyAddress, msg);
+                    this.messageCenter.SendRejection(msg, Message.RejectionTypes.Transient, "Target silo is known to be dead");
+                    return;
                 }
                 else
                 {
-                    _ = SendAsync(senderTask, msg);
-
-                    async Task SendAsync(ValueTask<Connection> c, Message m)
+                    var senderTask = this.connectionManager.GetConnection(msg.TargetSilo);
+                    if (senderTask.IsCompletedSuccessfully)
                     {
-                        try
+                        var sender = senderTask.Result;
+                        sender.Send(msg);
+                    }
+                    else
+                    {
+                        _ = SendAsync(senderTask, msg);
+
+                        async Task SendAsync(ValueTask<Connection> c, Message m)
                         {
-                            var sender = await c;
-                            sender.Send(m);
-                        }
-                        catch (Exception exception)
-                        {
-                            this.messageCenter.SendRejection(m, Message.RejectionTypes.Transient, $"Exception while sending message: {exception}");
+                            try
+                            {
+                                var sender = await c;
+                                sender.Send(m);
+                            }
+                            catch (Exception exception)
+                            {
+                                this.messageCenter.SendRejection(m, Message.RejectionTypes.Transient, $"Exception while sending message: {exception}");
+                            }
                         }
                     }
                 }

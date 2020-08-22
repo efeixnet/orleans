@@ -5,6 +5,7 @@ using Orleans.Configuration;
 using Orleans.Hosting;
 using Orleans.Runtime;
 using Orleans.TestingHost;
+using Orleans.Internal;
 using TestExtensions;
 using UnitTests.GrainInterfaces;
 using UnitTests.Grains;
@@ -26,9 +27,9 @@ namespace UnitTests.General
             }
         }
 
-        internal class SiloConfigurator : ISiloBuilderConfigurator
+        internal class SiloConfigurator : ISiloConfigurator
         {
-            public void Configure(ISiloHostBuilder hostBuilder)
+            public void Configure(ISiloBuilder hostBuilder)
             {
                 hostBuilder.AddMemoryGrainStorage("MemoryStore")
                     .AddMemoryGrainStorageAsDefault()

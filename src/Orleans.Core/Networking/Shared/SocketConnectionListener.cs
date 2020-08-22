@@ -5,6 +5,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.AspNetCore.Connections;
 
 namespace Orleans.Networking.Shared
 {
@@ -42,7 +43,13 @@ namespace Orleans.Networking.Shared
                 throw new InvalidOperationException("Transport already bound");
             }
 
-            var listenSocket = new Socket(EndPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+            var listenSocket = new Socket(EndPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp)
+            {
+                LingerState = new LingerOption(true, 0),
+                NoDelay = true
+            };
+
+            listenSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
             listenSocket.EnableFastPath();
 
             // Kestrel expects IPv6Any to bind to both IPv6 and IPv4

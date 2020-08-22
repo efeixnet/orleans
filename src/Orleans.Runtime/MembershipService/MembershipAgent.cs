@@ -6,13 +6,14 @@ using System.Threading.Tasks;
 using System.Threading;
 using Microsoft.Extensions.Options;
 using System.Linq;
+using Orleans.Internal;
 
 namespace Orleans.Runtime.MembershipService
 {
     /// <summary>
     /// Responsible for updating membership table with details about the local silo.
     /// </summary>
-    internal class MembershipAgent : ILifecycleParticipant<ISiloLifecycle>, IDisposable, MembershipAgent.ITestAccessor
+    internal class MembershipAgent : IHealthCheckParticipant, ILifecycleParticipant<ISiloLifecycle>, IDisposable, MembershipAgent.ITestAccessor
     {
         private readonly CancellationTokenSource cancellation = new CancellationTokenSource();
         private readonly MembershipTableManager tableManager;
@@ -130,7 +131,7 @@ namespace Orleans.Runtime.MembershipService
         private async Task ValidateInitialConnectivity()
         {
             // Continue attempting to validate connectivity until some reasonable timeout.
-            var maxAttemptTime = this.clusterMembershipOptions.ProbeTimeout.Multiply(5 * this.clusterMembershipOptions.NumMissedProbesLimit);
+            var maxAttemptTime = this.clusterMembershipOptions.ProbeTimeout.Multiply(5.0 * this.clusterMembershipOptions.NumMissedProbesLimit);
             var attemptNumber = 1;
             var now = this.getUtcDateTime();
             var attemptUntil = now + maxAttemptTime;
@@ -264,10 +265,7 @@ namespace Orleans.Runtime.MembershipService
         void ILifecycleParticipant<ISiloLifecycle>.Participate(ISiloLifecycle lifecycle)
         {
             {
-                Task OnRuntimeInitializeStart(CancellationToken ct)
-                {
-                    return Task.CompletedTask;
-                }
+                Task OnRuntimeInitializeStart(CancellationToken ct) => Task.CompletedTask;
 
                 async Task OnRuntimeInitializeStop(CancellationToken ct)
                 {
@@ -280,7 +278,7 @@ namespace Orleans.Runtime.MembershipService
 
                 lifecycle.Subscribe(
                     nameof(MembershipAgent),
-                    ServiceLifecycleStage.RuntimeInitialize,
+                    ServiceLifecycleStage.RuntimeInitialize + 1, // Gossip before the outbound queue gets closed
                     OnRuntimeInitializeStart,
                     OnRuntimeInitializeStop);
             }
@@ -321,15 +319,17 @@ namespace Orleans.Runtime.MembershipService
                     }
                     else
                     {
-                        var task = await Task.WhenAny(cancellationTask, this.BecomeShuttingDown());
-                        if (ReferenceEquals(task, cancellationTask))
+                        // Allow some minimum time for graceful shutdown.
+                        var gracePeriod = Task.WhenAll(Task.Delay(ClusterMembershipOptions.ClusteringShutdownGracePeriod), cancellationTask);
+                        var task = await Task.WhenAny(gracePeriod, this.BecomeShuttingDown());
+                        if (ReferenceEquals(task, gracePeriod))
                         {
                             this.log.LogWarning("Graceful shutdown aborted: starting ungraceful shutdown");
                             await Task.Run(() => this.BecomeStopping());
                         }
                         else
                         {
-                            await Task.WhenAny(cancellationTask, Task.WhenAll(tasks));
+                            await Task.WhenAny(gracePeriod, Task.WhenAll(tasks));
                         }
                     }
                 }
@@ -345,6 +345,12 @@ namespace Orleans.Runtime.MembershipService
         public void Dispose()
         {
             this.iAmAliveTimer.Dispose();
+        }
+
+        bool IHealthCheckable.CheckHealth(DateTime lastCheckTime)
+        {
+            var ok = this.iAmAliveTimer.CheckHealth(lastCheckTime);
+            return ok;
         }
     }
 }

@@ -6,6 +6,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Orleans.Concurrency;
 using Orleans.Configuration;
+using Orleans.Internal;
 using Orleans.Runtime;
 
 namespace Orleans.Streams
@@ -20,7 +21,7 @@ namespace Orleans.Streams
         private const int StreamInactivityCheckFrequency = 10;
         private readonly string streamProviderName;
         private readonly IStreamPubSub pubSub;
-        private readonly Dictionary<StreamId, StreamConsumerCollection> pubSubCache;
+        private readonly Dictionary<InternalStreamId, StreamConsumerCollection> pubSubCache;
         private readonly SafeRandom safeRandom;
         private readonly StreamPullingAgentOptions options;
         private readonly ILogger logger;
@@ -41,14 +42,15 @@ namespace Orleans.Streams
         private string StatisticUniquePostfix => streamProviderName + "." + QueueId;
 
         internal PersistentStreamPullingAgent(
-            GrainId id,
+            SystemTargetGrainId id,
             string strProviderName,
             IStreamProviderRuntime runtime,
             ILoggerFactory loggerFactory,
             IStreamPubSub streamPubSub,
             QueueId queueId,
-            StreamPullingAgentOptions options)
-            : base(id, runtime.ExecutingSiloAddress, true, loggerFactory)
+            StreamPullingAgentOptions options,
+            SiloAddress siloAddress)
+            : base(id, siloAddress, true, loggerFactory)
         {
             if (runtime == null) throw new ArgumentNullException("runtime", "PersistentStreamPullingAgent: runtime reference should not be null");
             if (strProviderName == null) throw new ArgumentNullException("runtime", "PersistentStreamPullingAgent: strProviderName should not be null");
@@ -56,15 +58,15 @@ namespace Orleans.Streams
             QueueId = queueId;
             streamProviderName = strProviderName;
             pubSub = streamPubSub;
-            pubSubCache = new Dictionary<StreamId, StreamConsumerCollection>();
+            pubSubCache = new Dictionary<InternalStreamId, StreamConsumerCollection>();
             safeRandom = new SafeRandom();
             this.options = options;
             numMessages = 0;
 
-            logger = runtime.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger($"{this.GetType().Namespace}.{((ISystemTargetBase)this).GrainId}.{streamProviderName}");
+            logger = runtime.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger($"{this.GetType().Namespace}.{streamProviderName}");
             logger.Info(ErrorCode.PersistentStreamPullingAgent_01,
                 "Created {0} {1} for Stream Provider {2} on silo {3} for Queue {4}.",
-                GetType().Name, ((ISystemTargetBase)this).GrainId.ToDetailedString(), streamProviderName, Silo, QueueId.ToStringWithHashCode());
+                GetType().Name, ((ISystemTargetBase)this).GrainId.ToString(), streamProviderName, Silo, QueueId.ToStringWithHashCode());
             numReadMessagesCounter = CounterStatistic.FindOrCreate(new StatisticName(StatisticNames.STREAMS_PERSISTENT_STREAM_NUM_READ_MESSAGES, StatisticUniquePostfix));
             numSentMessagesCounter = CounterStatistic.FindOrCreate(new StatisticName(StatisticNames.STREAMS_PERSISTENT_STREAM_NUM_SENT_MESSAGES, StatisticUniquePostfix));
             // TODO: move queue cache size statistics tracking into queue cache implementation once Telemetry APIs and LogStatistics have been reconciled.
@@ -95,7 +97,7 @@ namespace Orleans.Streams
         private void InitializeInternal(IQueueAdapter qAdapter, IQueueAdapterCache queueAdapterCache, IStreamFailureHandler failureHandler)
         {
             logger.Info(ErrorCode.PersistentStreamPullingAgent_02, "Init of {0} {1} on silo {2} for queue {3}.",
-                GetType().Name, ((ISystemTargetBase)this).GrainId.ToDetailedString(), Silo, QueueId.ToStringWithHashCode());
+                GetType().Name, ((ISystemTargetBase)this).GrainId.ToString(), Silo, QueueId.ToStringWithHashCode());
 
             // Remove cast once we cleanup
             queueAdapter = qAdapter;
@@ -200,7 +202,7 @@ namespace Orleans.Streams
                 tuple.Value.DisposeAll(logger);
                 var streamId = tuple.Key;
                 logger.Info(ErrorCode.PersistentStreamPullingAgent_06, "Unregister PersistentStreamPullingAgent Producer for stream {0}.", streamId);
-                unregisterTasks.Add(pubSub.UnregisterProducer(streamId, streamProviderName, meAsStreamProducer));
+                unregisterTasks.Add(pubSub.UnregisterProducer(streamId, meAsStreamProducer));
             }
 
             try
@@ -219,7 +221,7 @@ namespace Orleans.Streams
 
         public Task AddSubscriber(
             GuidId subscriptionId,
-            StreamId streamId,
+            InternalStreamId streamId,
             IStreamConsumerExtension streamConsumer,
             IStreamFilterPredicateWrapper filter)
         {
@@ -235,7 +237,7 @@ namespace Orleans.Streams
         // Called by rendezvous when new remote subscriber subscribes to this stream.
         private async Task AddSubscriber_Impl(
             GuidId subscriptionId,
-            StreamId streamId,
+            InternalStreamId streamId,
             IStreamConsumerExtension streamConsumer,
             StreamSequenceToken cacheToken,
             IStreamFilterPredicateWrapper filter)
@@ -315,13 +317,13 @@ namespace Orleans.Streams
             return true;
         }
 
-        public Task RemoveSubscriber(GuidId subscriptionId, StreamId streamId)
+        public Task RemoveSubscriber(GuidId subscriptionId, InternalStreamId streamId)
         {
             RemoveSubscriber_Impl(subscriptionId, streamId);
             return Task.CompletedTask;
         }
 
-        public void RemoveSubscriber_Impl(GuidId subscriptionId, StreamId streamId)
+        public void RemoveSubscriber_Impl(GuidId subscriptionId, InternalStreamId streamId)
         {
             if (IsShutdown) return;
 
@@ -445,9 +447,9 @@ namespace Orleans.Streams
             foreach (var group in
                 multiBatch
                 .Where(m => m != null)
-                .GroupBy(container => new Tuple<Guid, string>(container.StreamGuid, container.StreamNamespace)))
+                .GroupBy(container => container.StreamId))
             {
-                var streamId = StreamId.GetStreamId(group.Key.Item1, queueAdapter.Name, group.Key.Item2);
+                var streamId = new InternalStreamId(queueAdapter.Name, group.Key);
                 StreamSequenceToken startToken = group.First().SequenceToken;
                 StreamConsumerCollection streamData;
                 if (pubSubCache.TryGetValue(streamId, out streamData))
@@ -486,7 +488,7 @@ namespace Orleans.Streams
             });
         }
 
-        private async Task RegisterStream(StreamId streamId, StreamSequenceToken firstToken, DateTime now)
+        private async Task RegisterStream(InternalStreamId streamId, StreamSequenceToken firstToken, DateTime now)
         {
             var streamData = new StreamConsumerCollection(now);
             pubSubCache.Add(streamId, streamData);
@@ -724,7 +726,7 @@ namespace Orleans.Streams
             {
                 logger.Warn(ErrorCode.Stream_ConsumerIsDead,
                     "Consumer {0} on stream {1} is no longer active - permanently removing Consumer.", consumerData.StreamConsumer, consumerData.StreamId);
-                pubSub.UnregisterConsumer(consumerData.SubscriptionId, consumerData.StreamId, consumerData.StreamId.ProviderName).Ignore();
+                pubSub.UnregisterConsumer(consumerData.SubscriptionId, consumerData.StreamId).Ignore();
                 return true;
             }
 
@@ -767,12 +769,12 @@ namespace Orleans.Streams
             return false;
         }
 
-        private static async Task<ISet<PubSubSubscriptionState>> PubsubRegisterProducer(IStreamPubSub pubSub, StreamId streamId, string streamProviderName,
+        private static async Task<ISet<PubSubSubscriptionState>> PubsubRegisterProducer(IStreamPubSub pubSub, InternalStreamId streamId,
             IStreamProducerExtension meAsStreamProducer, ILogger logger)
         {
             try
             {
-                var streamData = await pubSub.RegisterProducer(streamId, streamProviderName, meAsStreamProducer);
+                var streamData = await pubSub.RegisterProducer(streamId, meAsStreamProducer);
                 return streamData;
             }
             catch (Exception e)
@@ -782,7 +784,7 @@ namespace Orleans.Streams
             }
         }
 
-        private async Task RegisterAsStreamProducer(StreamId streamId, StreamSequenceToken streamStartToken)
+        private async Task RegisterAsStreamProducer(InternalStreamId streamId, StreamSequenceToken streamStartToken)
         {
             try
             {
@@ -792,7 +794,7 @@ namespace Orleans.Streams
                 ISet<PubSubSubscriptionState> streamData = null;
                 await AsyncExecutorWithRetries.ExecuteWithRetries(
                                 async i => { streamData = 
-                                    await PubsubRegisterProducer(pubSub, streamId, streamProviderName, meAsStreamProducer, logger); },
+                                    await PubsubRegisterProducer(pubSub, streamId, meAsStreamProducer, logger); },
                                 AsyncExecutorWithRetries.INFINITE_RETRIES,
                                 (exception, i) => !IsShutdown,
                                 Constants.INFINITE_TIMESPAN,

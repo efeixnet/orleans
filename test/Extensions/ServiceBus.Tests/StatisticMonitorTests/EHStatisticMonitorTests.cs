@@ -38,9 +38,9 @@ namespace ServiceBus.Tests.MonitorTests
             }
 
 
-            private class MySiloBuilderConfigurator : ISiloBuilderConfigurator
+            private class MySiloBuilderConfigurator : ISiloConfigurator
             {
-                public void Configure(ISiloHostBuilder hostBuilder)
+                public void Configure(ISiloBuilder hostBuilder)
                 {
                     hostBuilder
                         .AddPersistentStreams(
@@ -55,7 +55,7 @@ namespace ServiceBus.Tests.MonitorTests
                     hostBuilder
                         .ConfigureServices(services =>
                         {
-                            services.AddTransientNamedService<Func<IStreamIdentity, IStreamDataGenerator<EventData>>>(StreamProviderName, (s, n) => SimpleStreamEventDataGenerator.CreateFactory(s));
+                            services.AddTransientNamedService<Func<StreamId, IStreamDataGenerator<EventData>>>(StreamProviderName, (s, n) => SimpleStreamEventDataGenerator.CreateFactory(s));
                         })
                         .AddMemoryGrainStorage("PubSubStore");
                 }
@@ -72,7 +72,7 @@ namespace ServiceBus.Tests.MonitorTests
             seed = new Random();
         }
 
-        [Fact, TestCategory("Functional")]
+        [Fact(Skip = "See https://github.com/dotnet/orleans/issues/4594"), TestCategory("Functional")]
         public async Task EHStatistics_MonitorCalledAccordingly()
         {
             var streamId = new FullStreamIdentity(Guid.NewGuid(), StreamNamespace, StreamProviderName);

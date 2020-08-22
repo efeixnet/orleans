@@ -4,10 +4,8 @@ using Amazon.Runtime;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 using Orleans;
-using Orleans.Clustering.DynamoDB;
-using Orleans.Configuration;
 using Orleans.Hosting;
-using Orleans.Runtime.Configuration;
+using Orleans.Internal;
 using Orleans.TestingHost;
 using System;
 using System.Collections.Generic;
@@ -28,7 +26,7 @@ namespace AWSUtils.Tests.Liveness
                 Orleans.AWSUtils.Tests.DynamoDBStorage storage;
                 try
                 {
-                    storage = new Orleans.AWSUtils.Tests.DynamoDBStorage(NullLoggerFactory.Instance, "http://localhost:8000");
+                    storage = new Orleans.AWSUtils.Tests.DynamoDBStorage(NullLoggerFactory.Instance.CreateLogger("DynamoDBStorage"), "http://localhost:8000");
                 }
                 catch (AmazonServiceException)
                 {
@@ -64,9 +62,9 @@ namespace AWSUtils.Tests.Liveness
             builder.AddClientBuilderConfigurator<ClientBuilderConfigurator>();
         }
 
-        public class SiloBuilderConfigurator : ISiloBuilderConfigurator
+        public class SiloBuilderConfigurator : ISiloConfigurator
         {
-            public void Configure(ISiloHostBuilder hostBuilder)
+            public void Configure(ISiloBuilder hostBuilder)
             {
                 hostBuilder.UseDynamoDBClustering(options => { options.Service = Service; });
             }

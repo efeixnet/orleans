@@ -5,7 +5,6 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
-using System.Resources;
 using System.Runtime.CompilerServices;
 using System.Runtime.Serialization;
 using System.Text;
@@ -17,12 +16,32 @@ namespace Orleans.Serialization
 {
     internal static class BinaryTokenStreamReaderExtensinons
     {
+        internal static IdSpan ReadIdSpan<TReader>(this TReader @this) where TReader : IBinaryTokenStreamReader
+        {
+            var hashCode = @this.ReadInt();
+            var len = @this.ReadUShort();
+            if (len == 0)
+            {
+                return default;
+            }
+
+            var bytes = @this.ReadBytes(len);
+            return IdSpan.UnsafeCreate(bytes, hashCode);
+        }
+
         /// <summary> Read an <c>GrainId</c> value from the stream. </summary>
         /// <returns>Data from current position in stream, converted to the appropriate output type.</returns>
         internal static GrainId ReadGrainId<TReader>(this TReader @this) where TReader : IBinaryTokenStreamReader
         {
-            UniqueKey key = @this.ReadUniqueKey();
-            return GrainId.GetGrainId(key);
+            var type = @this.ReadIdSpan();
+            var key = @this.ReadIdSpan();
+            return new GrainId(new GrainType(type), key);
+        }
+
+        internal static GrainInterfaceType ReadGrainInterfaceType<TReader>(this TReader @this) where TReader : IBinaryTokenStreamReader
+        {
+            var id = @this.ReadIdSpan();
+            return new GrainInterfaceType(id);
         }
 
         /// <summary> Read an <c>ActivationId</c> value from the stream. </summary>
@@ -65,7 +84,7 @@ namespace Orleans.Serialization
                 silo = null;
 
             if (act.Equals(ActivationId.Zero))
-                act = null;
+                act = default;
 
             return ActivationAddress.GetAddress(silo, grain, act);
         }
@@ -143,22 +162,16 @@ namespace Orleans.Serialization
                     result = @this.ReadChar();
                     break;
                 case SerializationTokenType.Guid:
-#if NETSTANDARD2_1
                     if (@this is BinaryTokenStreamReader2 reader)
                     {
-                        Span<byte> bytes = stackalloc byte[16];
-                        reader.ReadBytes(in bytes);
-                        result = new Guid(bytes);
+                        result = reader.ReadGuid();
                     }
                     else
                     {
                         var bytes = @this.ReadBytes(16);
                         result = new Guid(bytes);
                     }
-#else
-                    var bytes = @this.ReadBytes(16);
-                    result = new Guid(bytes);
-#endif
+
                     break;
                 case SerializationTokenType.Date:
                     result = DateTime.FromBinary(@this.ReadLong());
@@ -565,7 +578,7 @@ namespace Orleans.Serialization
         /// <summary>
         /// Gets the total length.
         /// </summary>
-        public int Length => this.totalLength;
+        public long Length => this.totalLength;
 
         /// <summary>
         /// Creates a copy of the current stream reader.

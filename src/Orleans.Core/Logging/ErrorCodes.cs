@@ -4,7 +4,7 @@ namespace Orleans
     /// <summary>
     /// The set of error types used by the Orleans runtime libraries for logging errors.
     /// </summary>
-    internal enum ErrorCode
+    public enum ErrorCode
     {
         Runtime = 100000,
         Runtime_Error_100001 = Runtime + 1,
@@ -440,6 +440,7 @@ namespace Orleans
         Catalog_FinishGrainDeactivateAndCleanupStreams_Exception = CatalogBase + 44,
         Catalog_DeactivateAllActivations                = CatalogBase + 45,
         Catalog_ActivationCollector_BadState_3          = CatalogBase + 46,
+        Catalog_UnregisterAsync                         = CatalogBase + 47,
 
         MembershipBase                         = Runtime + 600,
         MembershipCantWriteLivenessDisabled    = Runtime_Error_100225, // Backward compatability
@@ -623,7 +624,7 @@ namespace Orleans
         Messaging_IMA_ExceptionAccepting        = MessagingBase + 26,
         Messaging_IMA_BadBufferReceived         = MessagingBase + 27,
         Messaging_IMA_ActivationOverloaded      = MessagingBase + 28,
-        Messaging_Gateway_SerializationError    = MessagingBase + 29,
+        Messaging_SerializationError            = MessagingBase + 29,
         Messaging_UnableToDeserializeBody       = MessagingBase + 30,
         Messaging_Dispatcher_TryForward         = MessagingBase + 31,
         Messaging_Dispatcher_TryForwardFailed   = MessagingBase + 32,
@@ -632,6 +633,11 @@ namespace Orleans
         Messaging_Dispatcher_ReturnToOriginCluster    = MessagingBase + 35,
         MessagingAcceptAsyncSocketException     = MessagingBase + 36,
         Messaging_ExceptionReceiveAsync         = MessagingBase + 37,
+        Messaging_DroppingExpiredMessage        = MessagingBase + 38,
+        Messaging_DroppingBlockedMessage        = MessagingBase + 39,
+        Messaging_Inbound_Enqueue               = MessagingBase + 40,
+        Messaging_Inbound_Dequeue               = MessagingBase + 41,
+        Messaging_Dispatcher_Rejected           = MessagingBase + 42,
 
         DirectoryBase                           = Runtime + 1100,
         DirectoryBothPrimaryAndBackupForGrain   = DirectoryBase + 1,
@@ -758,7 +764,6 @@ namespace Orleans
         IGC_SendRequest_NullContext             = DispatcherBase + 26,
         IGC_SniffIncomingMessage_Exc            = DispatcherBase + 27,
         Dispatcher_DetectedDeadlock             = DispatcherBase + 28,
-        Dispatcher_DroppingExpiredMessage       = DispatcherBase + 29,
         Dispatcher_ActivationOverloaded         = DispatcherBase + 30,
         IGC_SendResponseFailed                  = DispatcherBase + 31,
         IGC_SendExceptionResponseFailed         = DispatcherBase + 32,
@@ -1044,6 +1049,9 @@ namespace Orleans
         Transactions_SendingTMRequest = TransactionsBase + 1,
         Transactions_ReceivedTMResponse = TransactionsBase + 2,
         Transactions_TMError = TransactionsBase + 3,
+
+        OSBase = Runtime + 4600,
+        OS_InvalidOS = OSBase + 1
     }
 }
 // ReSharper restore InconsistentNaming

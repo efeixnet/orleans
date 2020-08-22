@@ -1,5 +1,5 @@
 using System;
-using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
 using System.Threading;
@@ -20,14 +20,14 @@ namespace Orleans
     /// </summary>
     public class LifecycleSubject : ILifecycleSubject
     {
-        private readonly ConcurrentDictionary<object, OrderedObserver> subscribers;
+        private readonly List<OrderedObserver> subscribers;
         private readonly ILogger logger;
         private int? highStage = null;
 
         public LifecycleSubject(ILogger<LifecycleSubject> logger)
         {
             this.logger = logger;
-            this.subscribers = new ConcurrentDictionary<object, OrderedObserver>();
+            this.subscribers = new List<OrderedObserver>();
         }
 
         protected virtual string GetStageName(int stage) => stage.ToString();
@@ -82,7 +82,7 @@ namespace Orleans
             if (this.highStage.HasValue) throw new InvalidOperationException("Lifecycle has already been started.");
             try
             {
-                foreach (IGrouping<int, OrderedObserver> observerGroup in this.subscribers.Values
+                foreach (IGrouping<int, OrderedObserver> observerGroup in this.subscribers
                     .GroupBy(orderedObserver => orderedObserver.Stage)
                     .OrderBy(group => group.Key))
                 {
@@ -94,7 +94,7 @@ namespace Orleans
                     var stage = observerGroup.Key;
                     this.highStage = stage;
                     var stopWatch = ValueStopwatch.StartNew();
-                    await Task.WhenAll(observerGroup.Select(orderedObserver => CallOnStart(observerGroup.Key, orderedObserver, ct)));
+                    await Task.WhenAll(observerGroup.Select(orderedObserver => CallOnStart(orderedObserver, ct)));
                     stopWatch.Stop();
                     this.PerfMeasureOnStart(stage, stopWatch.Elapsed);
 
@@ -111,14 +111,21 @@ namespace Orleans
                 throw;
             }
 
-            async Task CallOnStart(int stage, OrderedObserver observer, CancellationToken cancellationToken)
+            static Task CallOnStart(OrderedObserver observer, CancellationToken cancellationToken)
             {
-                await observer.Observer.OnStart(cancellationToken);
+                try
+                {
+                    return observer.Observer?.OnStart(cancellationToken) ?? Task.CompletedTask;
+                }
+                catch (Exception ex)
+                {
+                    return Task.FromException(ex);
+                }
             }
         }
 
         protected virtual void OnStartStageCompleted(int stage) { }
-        
+
         protected virtual void PerfMeasureOnStop(int stage, TimeSpan elapsed)
         {
             if (this.logger != null && this.logger.IsEnabled(LogLevel.Trace))
@@ -136,11 +143,11 @@ namespace Orleans
             // if not started, do nothing
             if (!this.highStage.HasValue) return;
             var loggedCancellation = false;
-            foreach (IGrouping<int, OrderedObserver> observerGroup in this.subscribers.Values
+            foreach (IGrouping<int, OrderedObserver> observerGroup in this.subscribers
+                // include up to highest started stage
+                .Where(orderedObserver => orderedObserver.Stage <= highStage)
                 .GroupBy(orderedObserver => orderedObserver.Stage)
-                .OrderByDescending(group => group.Key)
-                // skip all until we hit the highest started stage
-                .SkipWhile(group => !this.highStage.Equals(group.Key)))
+                .OrderByDescending(group => group.Key))
             {
                 if (ct.IsCancellationRequested && !loggedCancellation)
                 {
@@ -153,7 +160,7 @@ namespace Orleans
                 try
                 {
                     var stopwatch = ValueStopwatch.StartNew();
-                    await Task.WhenAll(observerGroup.Select(orderedObserver => CallOnStop(observerGroup.Key, orderedObserver, ct)));
+                    await Task.WhenAll(observerGroup.Select(orderedObserver => CallOnStop(orderedObserver, ct)));
                     stopwatch.Stop();
                     this.PerfMeasureOnStop(stage, stopwatch.Elapsed);
                 }
@@ -167,9 +174,16 @@ namespace Orleans
                 this.OnStopStageCompleted(stage);
             }
 
-            async Task CallOnStop(int stage, OrderedObserver observer, CancellationToken cancellationToken)
+            static Task CallOnStop(OrderedObserver observer, CancellationToken cancellationToken)
             {
-                await observer.Observer.OnStop(cancellationToken);
+                try
+                {
+                    return observer.Observer?.OnStop(cancellationToken) ?? Task.CompletedTask;
+                }
+                catch (Exception ex)
+                {
+                    return Task.FromException(ex);
+                }
             }
         }
 
@@ -181,28 +195,13 @@ namespace Orleans
             if (this.highStage.HasValue) throw new InvalidOperationException("Lifecycle has already been started.");
 
             var orderedObserver = new OrderedObserver(stage, observer);
-            this.subscribers.TryAdd(orderedObserver, orderedObserver);
-            return new Disposable(() => this.subscribers.TryRemove(orderedObserver, out _));
+            this.subscribers.Add(orderedObserver);
+            return orderedObserver;
         }
 
-        private class Disposable : IDisposable
+        private class OrderedObserver : IDisposable
         {
-            private readonly Action dispose;
-
-            public Disposable(Action dispose)
-            {
-                this.dispose = dispose;
-            }
-
-            public void Dispose()
-            {
-                this.dispose();
-            }
-        }
-
-        private class OrderedObserver
-        {
-            public ILifecycleObserver Observer { get; }
+            public ILifecycleObserver Observer { get; private set; }
             public int Stage { get; }
 
             public OrderedObserver(int stage, ILifecycleObserver observer)
@@ -210,6 +209,8 @@ namespace Orleans
                 this.Stage = stage;
                 this.Observer = observer;
             }
+
+            public void Dispose() => Observer = null;
         }
     }
 }

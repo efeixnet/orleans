@@ -1,8 +1,8 @@
 using System;
-
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using Orleans.Configuration;
+using Orleans.Reminders.AzureStorage;
 using Orleans.Runtime.ReminderService;
 
 namespace Orleans.Hosting

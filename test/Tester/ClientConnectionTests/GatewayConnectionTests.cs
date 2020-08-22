@@ -16,6 +16,7 @@ using Xunit;
 using Microsoft.Extensions.DependencyInjection;
 using Orleans.Configuration;
 using Orleans.Hosting;
+using Orleans.Configuration.Internal;
 
 namespace Tester
 {
@@ -45,7 +46,7 @@ namespace Tester
 
     public class GatewayConnectionTests : TestClusterPerTest
     {
-        private readonly OutsideRuntimeClient runtimeClient;
+        private OutsideRuntimeClient runtimeClient;
 
         protected override void ConfigureTestCluster(TestClusterBuilder builder)
         {
@@ -55,9 +56,9 @@ namespace Tester
             builder.AddClientBuilderConfigurator<ClientBuilderConfigurator>();
         }
 
-        public class SiloBuilderConfigurator : ISiloBuilderConfigurator
+        public class SiloBuilderConfigurator : ISiloConfigurator
         {
-            public void Configure(ISiloHostBuilder hostBuilder)
+            public void Configure(ISiloBuilder hostBuilder)
             {
                 hostBuilder.UseLocalhostClustering();
                 hostBuilder.ConfigureServices((context, services) =>
@@ -97,8 +98,9 @@ namespace Tester
             }
         }
 
-        public GatewayConnectionTests()
+        public override async Task InitializeAsync()
         {
+            await base.InitializeAsync();
             this.runtimeClient = this.Client.ServiceProvider.GetRequiredService<OutsideRuntimeClient>();
         }
 

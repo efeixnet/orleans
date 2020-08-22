@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using System.Threading;
 using System.Collections.Immutable;
 using Orleans.Runtime.Utilities;
+using Orleans.Internal;
 
 namespace Orleans.Runtime.MembershipService
 {
@@ -74,16 +75,14 @@ namespace Orleans.Runtime.MembershipService
         private async Task ProcessMembershipUpdates()
         {
             ClusterMembershipSnapshot previous = default;
-            IAsyncEnumerator<MembershipTableSnapshot> enumerator = default;
             try
             {
                 if (this.log.IsEnabled(LogLevel.Debug)) this.log.LogDebug("Starting to process membership updates");
-                enumerator = this.membershipTableManager.MembershipTableUpdates.GetAsyncEnumerator(this.cancellation.Token);
-                while (await enumerator.MoveNextAsync())
+                await foreach (var tableSnapshot in this.membershipTableManager.MembershipTableUpdates.WithCancellation(this.cancellation.Token))
                 {
-                    var snapshot = enumerator.Current.CreateClusterMembershipSnapshot();
+                    var snapshot = tableSnapshot.CreateClusterMembershipSnapshot();
 
-                    var update = (previous is null) ? snapshot.AsUpdate() : snapshot.CreateUpdate(previous);
+                    var update = (previous is null || snapshot.Version == MembershipVersion.MinValue) ? snapshot.AsUpdate() : snapshot.CreateUpdate(previous);
                     this.NotifyObservers(update);
                     previous = snapshot;
                 }
@@ -95,7 +94,6 @@ namespace Orleans.Runtime.MembershipService
             }
             finally
             {
-                if (enumerator is object) await enumerator.DisposeAsync();
                 if (this.log.IsEnabled(LogLevel.Debug)) this.log.LogDebug("Stopping membership update processor");
             }
         }

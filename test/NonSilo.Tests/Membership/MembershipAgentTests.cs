@@ -137,9 +137,8 @@ namespace NonSilo.Tests.Membership
             Assert.Equal(SiloStatus.Joining, levels[ServiceLifecycleStage.AfterRuntimeGrainServices + 1]);
             Assert.Equal(SiloStatus.Active, levels[ServiceLifecycleStage.BecomeActive + 1]);
 
-            var stopped = this.lifecycle.OnStop();
-            foreach (var pair in this.timerCalls) while (pair.Value.TryDequeue(out var call)) call.Completion.TrySetResult(false);
-            await stopped;
+            await StopLifecycle();
+
             Assert.Equal(SiloStatus.ShuttingDown, levels[ServiceLifecycleStage.BecomeActive - 1]);
             Assert.Equal(SiloStatus.ShuttingDown, levels[ServiceLifecycleStage.AfterRuntimeGrainServices - 1]);
             Assert.Equal(SiloStatus.Dead, levels[ServiceLifecycleStage.RuntimeInitialize - 1]);
@@ -182,7 +181,8 @@ namespace NonSilo.Tests.Membership
 
             var cancellation = new CancellationTokenSource();
             cancellation.Cancel();
-            await this.lifecycle.OnStop(cancellation.Token);
+            await StopLifecycle(cancellation.Token);
+
             Assert.Equal(SiloStatus.Stopping, levels[ServiceLifecycleStage.BecomeActive - 1]);
             Assert.Equal(SiloStatus.Stopping, levels[ServiceLifecycleStage.AfterRuntimeGrainServices - 1]);
             Assert.Equal(SiloStatus.Dead, levels[ServiceLifecycleStage.RuntimeInitialize - 1]);
@@ -227,15 +227,13 @@ namespace NonSilo.Tests.Membership
             this.fatalErrorHandler.ReceivedWithAnyArgs().OnFatalException(default, default, default);
 
             // Stop & cancel all timers.
-            var stopped = this.lifecycle.OnStop();
-            foreach (var pair in this.timerCalls) while (pair.Value.TryDequeue(out var call)) call.Completion.TrySetResult(false);
-            //await stopped;
+            await StopLifecycle();
         }
 
         [Fact]
         public async Task MembershipAgent_LifecycleStages_ValidateInitialConnectivity_Success()
         {
-            MessagingStatisticsGroup.Init(true);
+            MessagingStatisticsGroup.Init();
             var otherSilos = new[]
             {
                 Entry(Silo("127.0.0.200:100@100"), SiloStatus.Active),
@@ -269,15 +267,13 @@ namespace NonSilo.Tests.Membership
             await Until(() => started.IsCompleted);
             await started;
 
-            var stopped = this.lifecycle.OnStop();
-            foreach (var pair in this.timerCalls) while (pair.Value.TryDequeue(out var call)) call.Completion.TrySetResult(false);
-            await stopped;
+            await StopLifecycle();
         }
 
         [Fact]
         public async Task MembershipAgent_LifecycleStages_ValidateInitialConnectivity_Failure()
         {
-            MessagingStatisticsGroup.Init(true);
+            MessagingStatisticsGroup.Init();
 
             this.timerFactory.CreateDelegate = (period, name) => new DelegateAsyncTimer(_ => Task.FromResult(false));
 
@@ -318,8 +314,7 @@ namespace NonSilo.Tests.Membership
             // Startup should have faulted.
             Assert.True(started.IsFaulted);
 
-            var stopped = this.lifecycle.OnStop();
-            await stopped;
+            await StopLifecycle();
         }
 
         private static SiloAddress Silo(string value) => SiloAddress.FromParsableString(value);
@@ -331,6 +326,19 @@ namespace NonSilo.Tests.Membership
             var maxTimeout = 40_000;
             while (!condition() && (maxTimeout -= 10) > 0) await Task.Delay(10);
             Assert.True(maxTimeout > 0);
+        }
+
+        private async Task StopLifecycle(CancellationToken cancellation = default)
+        {
+            var stopped = this.lifecycle.OnStop(cancellation);
+
+            while (!stopped.IsCompleted)
+            {
+                foreach (var pair in this.timerCalls) while (pair.Value.TryDequeue(out var call)) call.Completion.TrySetResult(false);
+                await Task.Delay(15);
+            }
+
+            await stopped;
         }
     }
 }

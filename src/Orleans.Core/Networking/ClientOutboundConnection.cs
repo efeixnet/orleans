@@ -1,81 +1,58 @@
 using System;
-using System.Runtime.ExceptionServices;
+using System.Diagnostics;
 using System.Text;
 using System.Threading.Tasks;
+using Microsoft.AspNetCore.Connections;
 using Microsoft.Extensions.Logging;
 using Orleans.Configuration;
 using Orleans.Messaging;
-using Orleans.Networking.Shared;
 
 namespace Orleans.Runtime.Messaging
 {
     internal sealed class ClientOutboundConnection : Connection
     {
-        private readonly MessageFactory messageFactory;
         private readonly ClientMessageCenter messageCenter;
-        private readonly GatewayManager gatewayManager;
         private readonly ConnectionManager connectionManager;
         private readonly ConnectionOptions connectionOptions;
+        private readonly SiloAddress remoteSiloAddress;
 
         public ClientOutboundConnection(
             SiloAddress remoteSiloAddress,
             ConnectionContext connection,
             ConnectionDelegate middleware,
-            MessageFactory messageFactory,
-            IServiceProvider serviceProvider,
             ClientMessageCenter messageCenter,
-            GatewayManager gatewayManager,
-            INetworkingTrace trace,
             ConnectionManager connectionManager,
-            ConnectionOptions connectionOptions)
-            : base(connection, middleware, serviceProvider, trace)
+            ConnectionOptions connectionOptions,
+            ConnectionCommon connectionShared)
+            : base(connection, middleware, connectionShared)
         {
-            this.messageFactory = messageFactory;
             this.messageCenter = messageCenter;
-            this.gatewayManager = gatewayManager;
             this.connectionManager = connectionManager;
             this.connectionOptions = connectionOptions;
-            this.RemoteSiloAddress = remoteSiloAddress ?? throw new ArgumentNullException(nameof(remoteSiloAddress));
+            this.remoteSiloAddress = remoteSiloAddress ?? throw new ArgumentNullException(nameof(remoteSiloAddress));
+            this.MessageReceivedCounter = MessagingStatisticsGroup.GetMessageReceivedCounter(this.remoteSiloAddress);
+            this.MessageSentCounter = MessagingStatisticsGroup.GetMessageSendCounter(this.remoteSiloAddress);
         }
 
+        protected override ConnectionDirection ConnectionDirection => ConnectionDirection.ClientToGateway;
+
         protected override IMessageCenter MessageCenter => this.messageCenter;
-        
-        public SiloAddress RemoteSiloAddress { get; }
 
         protected override void OnReceivedMessage(Message message)
         {
             this.messageCenter.OnReceivedMessage(message);
         }
 
-        protected override void OnReceiveMessageFailure(Message message, Exception exception)
-        {
-            // If deserialization completely failed or the message was one-way, rethrow the exception
-            // so that it can be handled at another level.
-            if (message?.Headers == null || message.Direction != Message.Directions.Request)
-            {
-                ExceptionDispatchInfo.Capture(exception).Throw();
-            }
-
-            // The message body was not successfully decoded, but the headers were.
-            // Send a fast fail to the caller.
-            MessagingStatisticsGroup.OnRejectedMessage(message);
-            var response = this.messageFactory.CreateResponseMessage(message);
-            response.Result = Message.ResponseTypes.Error;
-            response.BodyObject = Response.ExceptionResponse(exception);
-
-            // Send the error response and continue processing the next message.
-            this.messageCenter.SendMessage(response);
-        }
-
         protected override async Task RunInternal()
         {
+            Exception error = default;
             try
             {
                 this.messageCenter.OnGatewayConnectionOpen();
 
                 await ConnectionPreamble.Write(
                     this.Context,
-                    this.messageCenter.ClientId,
+                    this.messageCenter.ClientId.GrainId,
                     this.connectionOptions.ProtocolVersion,
                     siloAddress: null);
 
@@ -90,10 +67,13 @@ namespace Orleans.Runtime.Messaging
 
                 await base.RunInternal();
             }
+            catch (Exception exception) when ((error = exception) is null)
+            {
+                Debug.Fail("Execution should not be able to reach this point.");
+            }
             finally
             {
-                this.gatewayManager.MarkAsDead(this.RemoteSiloAddress);
-                this.connectionManager.OnConnectionTerminated(this.RemoteSiloAddress, this);
+                this.connectionManager.OnConnectionTerminated(this.remoteSiloAddress, this, error);
                 this.messageCenter.OnGatewayConnectionClosed();
             }
         }
@@ -104,7 +84,7 @@ namespace Orleans.Runtime.Messaging
             if (!this.IsValid)
             {
                 // Recycle the message we've dequeued. Note that this will recycle messages that were queued up to be sent when the gateway connection is declared dead
-                msg.TargetActivation = null;
+                msg.TargetActivation = default;
                 msg.TargetSilo = null;
                 this.messageCenter.SendMessage(msg);
                 return false;
@@ -112,9 +92,9 @@ namespace Orleans.Runtime.Messaging
 
             if (msg.TargetSilo != null) return true;
 
-            msg.TargetSilo = this.RemoteSiloAddress;
-            if (msg.TargetGrain.IsSystemTarget)
-                msg.TargetActivation = ActivationId.GetSystemActivation(msg.TargetGrain, msg.TargetSilo);
+            msg.TargetSilo = this.remoteSiloAddress;
+            if (msg.TargetGrain.IsSystemTarget())
+                msg.TargetActivation = ActivationId.GetDeterministic(msg.TargetGrain);
 
             return true;
         }
@@ -144,7 +124,7 @@ namespace Orleans.Runtime.Messaging
         {
             MessagingStatisticsGroup.OnRejectedMessage(msg);
             if (string.IsNullOrEmpty(reason)) reason = string.Format("Rejection from silo - Unknown reason.");
-            var error = this.messageFactory.CreateRejectionResponse(msg, rejectionType, reason);
+            var error = this.MessageFactory.CreateRejectionResponse(msg, rejectionType, reason);
 
             // rejection msgs are always originated locally, they are never remote.
             this.OnReceivedMessage(error);
@@ -162,44 +142,6 @@ namespace Orleans.Runtime.Messaging
             else
             {
                 this.Log.Info(ErrorCode.Messaging_OutgoingMS_DroppingMessage, "Client is dropping message: {<essage}. Reason = {Reason}", msg, reason);
-                MessagingStatisticsGroup.OnDroppedSentMessage(msg);
-            }
-        }
-
-        protected override void OnMessageSerializationFailure(Message msg, Exception exc)
-        {
-            // we only get here if we failed to serialize the msg (or any other catastrophic failure).
-            // Request msg fails to serialize on the sender, so we just enqueue a rejection msg.
-            // Response msg fails to serialize on the responding silo, so we try to send an error response back.
-            this.Log.LogWarning(
-                (int)ErrorCode.ProxyClient_SerializationError,
-                "Unexpected error serializing message {Message}: {Exception}",
-                msg,
-                exc);
-
-            MessagingStatisticsGroup.OnFailedSentMessage(msg);
-
-            if (msg.Direction == Message.Directions.Request)
-            {
-                this.messageCenter.RejectMessage(msg, $"Unable to serialize message. Encountered exception: {exc?.GetType()}: {exc?.Message}", exc);
-            }
-            else if (msg.Direction == Message.Directions.Response && msg.RetryCount < MessagingOptions.DEFAULT_MAX_MESSAGE_SEND_RETRIES)
-            {
-                // if we failed sending an original response, turn the response body into an error and reply with it.
-                // unless we have already tried sending the response multiple times.
-                msg.Result = Message.ResponseTypes.Error;
-                msg.BodyObject = Response.ExceptionResponse(exc);
-                msg.RetryCount = msg.RetryCount + 1;
-                this.messageCenter.SendMessage(msg);
-            }
-            else
-            {
-                this.Log.LogWarning(
-                    (int)ErrorCode.ProxyClient_DroppingMsg,
-                    "Gateway client is dropping message which failed during serialization: {Message}. Exception = {Exception}",
-                    msg,
-                    exc);
-
                 MessagingStatisticsGroup.OnDroppedSentMessage(msg);
             }
         }

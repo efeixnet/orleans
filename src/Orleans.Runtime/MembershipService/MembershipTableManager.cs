@@ -3,13 +3,12 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
 using System.Reflection;
-using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Orleans.Configuration;
-using Orleans.Runtime.Messaging;
+using Orleans.Internal;
 using Orleans.Runtime.Utilities;
 
 namespace Orleans.Runtime.MembershipService
@@ -62,7 +61,7 @@ namespace Orleans.Runtime.MembershipService
                     MembershipVersion.MinValue,
                     initialEntries);
             this.updates = new AsyncEnumerable<MembershipTableSnapshot>(
-                (previous, proposed) => proposed.Version > previous.Version,
+                (previous, proposed) => proposed.Version == MembershipVersion.MinValue || proposed.Version > previous.Version,
                 this.snapshot)
             {
                 OnPublished = update => Interlocked.Exchange(ref this.snapshot, update)
@@ -96,6 +95,9 @@ namespace Orleans.Runtime.MembershipService
 
         public async Task RefreshFromSnapshot(MembershipTableSnapshot snapshot)
         {
+            if (snapshot.Version == MembershipVersion.MinValue)
+                throw new ArgumentException("Cannot call RefreshFromSnapshot with Version == MembershipVersion.MinValue");
+
             // Check if a refresh is underway
             var pending = this.pendingRefresh;
             if (pending != null && !pending.IsCompleted)
@@ -759,9 +761,9 @@ namespace Orleans.Runtime.MembershipService
                 {
                     if (log.IsEnabled(LogLevel.Debug)) log.Debug("-Successfully updated {0} status to Dead in the Membership table.", entry.SiloAddress);
 
-                    GossipToOthers(entry.SiloAddress, entry.Status).Ignore();
                     var table = await membershipTableProvider.ReadAll();
                     this.ProcessTableUpdate(table, "DeclareDead");
+                    GossipToOthers(entry.SiloAddress, entry.Status).Ignore();
                     return true;
                 }
                 
@@ -775,7 +777,7 @@ namespace Orleans.Runtime.MembershipService
 
         bool IHealthCheckable.CheckHealth(DateTime lastCheckTime)
         {
-            bool ok = this.membershipUpdateTimer.CheckHealth(lastCheckTime);
+            var ok = this.membershipUpdateTimer.CheckHealth(lastCheckTime);
             return ok;
         }
 
@@ -797,7 +799,10 @@ namespace Orleans.Runtime.MembershipService
             async Task OnRuntimeGrainServicesStop(CancellationToken ct)
             {
                 this.membershipUpdateTimer.Dispose();
-                await Task.WhenAny(ct.WhenCancelled(), Task.WhenAll(tasks));
+
+                // Allow some minimum time for graceful shutdown.
+                var gracePeriod = Task.WhenAll(Task.Delay(ClusterMembershipOptions.ClusteringShutdownGracePeriod), ct.WhenCancelled());
+                await Task.WhenAny(gracePeriod, Task.WhenAll(tasks));
             }
         }
 

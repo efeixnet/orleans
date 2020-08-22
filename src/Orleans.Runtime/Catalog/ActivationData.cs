@@ -7,13 +7,10 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using Orleans.CodeGeneration;
 using Orleans.Configuration;
-using Orleans.Core;
-using Orleans.GrainDirectory;
+using Orleans.GrainReferences;
 using Orleans.Runtime.Configuration;
 using Orleans.Runtime.Scheduler;
-using Orleans.Storage;
 
 namespace Orleans.Runtime
 {
@@ -22,40 +19,38 @@ namespace Orleans.Runtime
     /// MUST lock this object for any concurrent access
     /// Consider: compartmentalize by usage, e.g., using separate interfaces for data for catalog, etc.
     /// </summary>
-    internal class ActivationData : IGrainActivationContext, IActivationData, IInvokable, IDisposable
+    internal class ActivationData : IActivationData, IGrainExtensionBinder, IAsyncDisposable
     {
-        internal class GrainActivationContextFactory
-        {
-            public IGrainActivationContext Context { get; set; }
-        }
-
         // This is the maximum amount of time we expect a request to continue processing
         private readonly TimeSpan maxRequestProcessingTime;
         private readonly TimeSpan maxWarningRequestProcessingTime;
         private readonly SiloMessagingOptions messagingOptions;
-        public readonly TimeSpan CollectionAgeLimit;
         private readonly ILogger logger;
-        private IGrainMethodInvoker lastInvoker;
-        private IServiceScope serviceScope;
+        private readonly IServiceScope serviceScope;
+        public readonly TimeSpan CollectionAgeLimit;
+        private readonly GrainTypeComponents _shared;
         private HashSet<IGrainTimer> timers;
-        
+        private Dictionary<Type, object> _components;
+
         public ActivationData(
             ActivationAddress addr,
-            string genericArguments,
             PlacementStrategy placedUsing,
-            IMultiClusterRegistrationStrategy registrationStrategy,
             IActivationCollector collector,
             TimeSpan ageLimit,
             IOptions<SiloMessagingOptions> messagingOptions,
             TimeSpan maxWarningRequestProcessingTime,
 			TimeSpan maxRequestProcessingTime,
-            IRuntimeClient runtimeClient,
-            ILoggerFactory loggerFactory)
+            ILoggerFactory loggerFactory,
+            IServiceProvider applicationServices,
+            IGrainRuntime grainRuntime,
+            GrainReferenceActivator referenceActivator,
+            GrainTypeComponents sharedComponents)
         {
             if (null == addr) throw new ArgumentNullException(nameof(addr));
             if (null == placedUsing) throw new ArgumentNullException(nameof(placedUsing));
             if (null == collector) throw new ArgumentNullException(nameof(collector));
 
+            _shared = sharedComponents;
             logger = loggerFactory.CreateLogger<ActivationData>();
             this.lifecycle = new GrainLifecycle(loggerFactory.CreateLogger<LifecycleSubject>());
             this.maxRequestProcessingTime = maxRequestProcessingTime;
@@ -65,102 +60,72 @@ namespace Orleans.Runtime
             Address = addr;
             State = ActivationState.Create;
             PlacedUsing = placedUsing;
-            RegistrationStrategy = registrationStrategy;
-            if (!Grain.IsSystemTarget)
+            if (!this.GrainId.IsSystemTarget())
             {
                 this.collector = collector;
             }
 
             CollectionAgeLimit = ageLimit;
 
-            GrainReference = GrainReference.FromGrainId(addr.Grain, runtimeClient.GrainReferenceRuntime, genericArguments, Grain.IsSystemTarget ? addr.Silo : null);
-            this.SchedulingContext = new SchedulingContext(this);
+            this.GrainReference = referenceActivator.CreateReference(addr.Grain, default);
+            this.serviceScope = applicationServices.CreateScope();
+            this.Runtime = grainRuntime;
         }
 
-        public Type GrainType => GrainTypeData.Type;
-
-        public IGrainIdentity GrainIdentity => this.Identity;
+        public IGrainRuntime Runtime { get; }
 
         public IServiceProvider ActivationServices => this.serviceScope.ServiceProvider;
 
-        private ExtensionInvoker extensionInvoker;
-        internal ExtensionInvoker ExtensionInvoker
+        internal WorkItemGroup WorkItemGroup { get; set; }
+
+        public TComponent GetComponent<TComponent>()
         {
-            get
+            TComponent result;
+            if (this.GrainInstance is TComponent grainResult)
             {
-                this.lastInvoker = null;
-                return this.extensionInvoker ?? (this.extensionInvoker = new ExtensionInvoker());
+                result = grainResult;
             }
-        }
-
-        public IGrainMethodInvoker GetInvoker(GrainTypeManager typeManager, int interfaceId, string genericGrainType = null)
-        {
-            // Return previous cached invoker, if applicable
-            if (lastInvoker != null && interfaceId == lastInvoker.InterfaceId) // extension invoker returns InterfaceId==0, so this condition will never be true if an extension is installed
-                return lastInvoker;
-
-            if (extensionInvoker != null && extensionInvoker.IsExtensionInstalled(interfaceId))
+            else if (this is TComponent contextResult)
             {
-                // Shared invoker for all extensions installed on this grain
-                lastInvoker = extensionInvoker;
+                result = contextResult;
+            }
+            else if (_components is object && _components.TryGetValue(typeof(TComponent), out var resultObj))
+            {
+                result = (TComponent)resultObj;
             }
             else
             {
-                // Find the specific invoker for this interface / grain type
-                lastInvoker = typeManager.GetInvoker(interfaceId, genericGrainType);
+                result = _shared.GetComponent<TComponent>();
             }
 
-            return lastInvoker;
+            return result;
         }
 
-        public HashSet<ActivationId> RunningRequestsSenders { get; } = new HashSet<ActivationId>();
-
-        public ISchedulingContext SchedulingContext { get; }
-
-        public string GrainTypeName
+        public void SetComponent<TComponent>(TComponent instance)
         {
-            get
+            if (this.GrainInstance is TComponent)
             {
-                if (GrainInstanceType == null)
-                {
-                    throw new ArgumentNullException("GrainInstanceType", "GrainInstanceType has not been set.");
-                }
-                return GrainInstanceType.FullName;
+                throw new ArgumentException("Cannot override a component which is implemented by this grain");
             }
-        }
 
-        internal Type GrainInstanceType => GrainTypeData?.Type;
+            if (this is TComponent)
+            {
+                throw new ArgumentException("Cannot override a component which is implemented by this grain context");
+            }
+
+            if (instance == null)
+            {
+                _components?.Remove(typeof(TComponent));
+                return;
+            }
+
+            if (_components is null) _components = new Dictionary<Type, object>();
+            _components[typeof(TComponent)] = instance;
+        }
 
         internal void SetGrainInstance(Grain grainInstance)
         {
             GrainInstance = grainInstance;
-        }
-
-        internal void SetupContext(GrainTypeData typeData, IServiceProvider grainServices)
-        {
-            this.GrainTypeData = typeData;
-            this.Items = new Dictionary<object, object>();
-            this.serviceScope = grainServices.CreateScope();
-
-            SetGrainActivationContextInScopedServices(this.ActivationServices, this);
-
-            if (typeData != null)
-            {
-                var grainType = typeData.Type;
-
-                // Don't ever collect system grains or reminder table grain or memory store grains.
-                bool doNotCollect = typeof(IReminderTableGrain).IsAssignableFrom(grainType) || typeof(IMemoryStorageGrain).IsAssignableFrom(grainType);
-                if (doNotCollect)
-                {
-                    this.collector = null;
-                }
-            }
-        }
-
-        private static void SetGrainActivationContextInScopedServices(IServiceProvider sp, IGrainActivationContext context)
-        {
-            var contextFactory = sp.GetRequiredService<GrainActivationContextFactory>();
-            contextFactory.Context = context;
         }
         
         private Streams.StreamDirectory streamDirectory;
@@ -177,7 +142,7 @@ namespace Orleans.Runtime
         internal async Task DeactivateStreamResources()
         {
             if (streamDirectory == null) return; // No streams - Nothing to do.
-            if (extensionInvoker == null) return; // No installed extensions - Nothing to do.
+            if (_components == null) return; // No installed extensions - Nothing to do.
 
             if (StreamResourceTestControl.TestOnlySuppressStreamCleanupOnDeactivate)
             {
@@ -188,27 +153,13 @@ namespace Orleans.Runtime
             await streamDirectory.Cleanup(true, false);
         }
 
-        GrainReference IActivationData.GrainReference
-        {
-            get { return GrainReference; }
-        }
-        
-        public GrainId Identity
-        {
-            get { return Grain; }
-        }
-
-        public GrainTypeData GrainTypeData { get; private set; }
-
-        public Grain GrainInstance { get; private set; }
+        public IAddressable GrainInstance { get; private set; }
 
         public ActivationId ActivationId { get { return Address.Activation; } }
 
         public ActivationAddress Address { get; private set; }
 
         public IServiceProvider ServiceProvider => this.serviceScope?.ServiceProvider;
-
-        public IDictionary<object, object> Items { get; private set; }
 
         private readonly GrainLifecycle lifecycle;
 
@@ -221,11 +172,11 @@ namespace Orleans.Runtime
             AddTimer(timer);
         }
 
-        internal readonly GrainReference GrainReference;
+        public GrainReference GrainReference { get; }
 
         public SiloAddress Silo { get { return Address.Silo;  } }
 
-        public GrainId Grain { get { return Address.Grain; } }
+        public GrainId GrainId { get { return Address.Grain; } }
 
         public ActivationState State { get; private set; }
 
@@ -294,8 +245,6 @@ namespace Orleans.Runtime
 
         public PlacementStrategy PlacedUsing { get; private set; }
 
-        public IMultiClusterRegistrationStrategy RegistrationStrategy { get; private set; }
-
         // Currently, the only supported multi-activation grain is one using the StatelessWorkerPlacement strategy.
         internal bool IsStatelessWorker => this.PlacedUsing is StatelessWorkerPlacement;
         
@@ -306,10 +255,7 @@ namespace Orleans.Runtime
         internal bool IsUsingGrainDirectory => this.PlacedUsing.IsUsingGrainDirectory;
 
         public Message Blocking { get; private set; }
-
-        // the number of requests that are currently executing on this activation.
-        // includes reentrant and non-reentrant requests.
-        private int numRunning;
+        public Dictionary<Message, DateTime> RunningRequests { get; private set; } = new Dictionary<Message, DateTime>();
 
         private DateTime currentRequestStartTime;
         private DateTime becameIdle;
@@ -318,29 +264,23 @@ namespace Orleans.Runtime
         public void RecordRunning(Message message, bool isInterleavable)
         {
             // Note: This method is always called while holding lock on this activation, so no need for additional locks here
-
-            numRunning++;
-            if (message.Direction != Message.Directions.OneWay 
-                && message.SendingActivation != null
-                && !message.SendingGrain?.IsClient == true)
-            {
-                RunningRequestsSenders.Add(message.SendingActivation);
-            }
+            var now = DateTime.UtcNow;
+            RunningRequests.Add(message, now);
 
             if (this.Blocking != null || isInterleavable) return;
 
             // This logic only works for non-reentrant activations
             // Consider: Handle long request detection for reentrant activations.
             this.Blocking = message;
-            currentRequestStartTime = DateTime.UtcNow;
+            currentRequestStartTime = now;
         }
 
         public void ResetRunning(Message message)
         {
             // Note: This method is always called while holding lock on this activation, so no need for additional locks here
-            numRunning--;
-            RunningRequestsSenders.Remove(message.SendingActivation);
-            if (numRunning == 0)
+            RunningRequests.Remove(message);
+
+            if (RunningRequests.Count == 0)
             {
                 becameIdle = DateTime.UtcNow;
                 if (!IsExemptFromCollection)
@@ -400,6 +340,7 @@ namespace Orleans.Runtime
             Success,
             ErrorInvalidActivation,
             ErrorStuckActivation,
+            ErrorActivateFailed,
         }
 
         /// <summary>
@@ -416,13 +357,19 @@ namespace Orleans.Runtime
                         "Cannot enqueue message to invalid activation {0} : {1}", this.ToDetailedString(), message);
                     return EnqueueMessageResult.ErrorInvalidActivation;
                 }
+                if (State == ActivationState.FailedToActivate)
+                {
+                    logger.Warn(ErrorCode.Dispatcher_InvalidActivation,
+                        "Cannot enqueue message to activation that failed in OnActivate {0} : {1}", this.ToDetailedString(), message);
+                    return EnqueueMessageResult.ErrorActivateFailed;
+                }
                 if (State == ActivationState.Deactivating)
                 {
                     var deactivatingTime = DateTime.UtcNow - deactivationStartTime;
                     if (deactivatingTime > maxRequestProcessingTime)
                     {
                         logger.Error(ErrorCode.Dispatcher_StuckActivation,
-                            $"Current activation {ToDetailedString()} marked as Deactivating for {deactivatingTime}. Trying  to enqueue {message}.");
+                            $"Current activation {ToDetailedString()} marked as Deactivating for {deactivatingTime}. Trying to enqueue {message}.");
                         return EnqueueMessageResult.ErrorStuckActivation;
                     }
                 }
@@ -432,7 +379,7 @@ namespace Orleans.Runtime
                     if (currentRequestActiveTime > maxRequestProcessingTime)
                     {
                         logger.Error(ErrorCode.Dispatcher_StuckActivation,
-                            $"Current request has been active for {currentRequestActiveTime} for activation {ToDetailedString()}. Currently executing {this.Blocking}.  Trying  to enqueue {message}.");
+                            $"Current request has been active for {currentRequestActiveTime} for activation {ToDetailedString()}. Currently executing {this.Blocking}. Trying to enqueue {message}.");
                         return EnqueueMessageResult.ErrorStuckActivation;
                     }
                     // Consider: Handle long request detection for reentrant activations -- this logic only works for non-reentrant activations
@@ -444,8 +391,14 @@ namespace Orleans.Runtime
                     }
                 }
 
-                waiting = waiting ?? new List<Message>();
+                if (!message.QueuedTime.HasValue)
+                {
+                    message.QueuedTime = DateTime.UtcNow;
+                }
+
+                waiting ??= new List<Message>();
                 waiting.Add(message);
+
                 return EnqueueMessageResult.Success;
             }
         }
@@ -537,7 +490,7 @@ namespace Orleans.Runtime
         {
             get
             {
-                return numRunning > 0 ;
+                return RunningRequests.Count > 0;
             }
         }
 
@@ -599,8 +552,13 @@ namespace Orleans.Runtime
                     OnInactive = new List<Action>();
                 }
                 OnInactive.Add(action);
+                if (!IsCurrentlyExecuting)
+                {
+                    RunOnInactive();
+                }
             }
         }
+
         public void RunOnInactive()
         {
             lock (this)
@@ -643,7 +601,7 @@ namespace Orleans.Runtime
 
         public void OnTimerDisposed(IGrainTimer orleansTimerInsideGrain)
         {
-            lock (this) // need to lock since dispose can be called on finalizer thread, outside garin context (not single threaded).
+            lock (this) // need to lock since dispose can be called on finalizer thread, outside grain context (not single threaded).
             {
                 timers.Remove(orleansTimerInsideGrain);
             }
@@ -669,15 +627,115 @@ namespace Orleans.Runtime
             }
         }
 
+        public void AnalyzeWorkload(DateTime now, IMessageCenter messageCenter, MessageFactory messageFactory, SiloMessagingOptions options)
+        {
+            var slowRunningRequestDuration = options.RequestProcessingWarningTime;
+            var longQueueTimeDuration = options.RequestQueueDelayWarningTime;
+
+            List<string> diagnostics = null;
+            lock (this)
+            {
+                if (State != ActivationState.Valid)
+                {
+                    return;
+                }
+
+                if (this.Blocking is object)
+                {
+                    var message = this.Blocking;
+                    var timeSinceQueued = now - message.QueuedTime;
+                    var executionTime = now - currentRequestStartTime;
+                    if (executionTime >= slowRunningRequestDuration)
+                    {
+                        GetStatusList(ref diagnostics);
+                        if (timeSinceQueued.HasValue)
+                        {
+                            diagnostics.Add($"Message {message} was enqueued {timeSinceQueued} ago and has now been executing for {executionTime}.");
+                        }
+                        else
+                        {
+                            diagnostics.Add($"Message {message} was has been executing for {executionTime}.");
+                        }
+
+                        var response = messageFactory.CreateDiagnosticResponseMessage(message, isExecuting: true, isWaiting: false, diagnostics);
+                        messageCenter.SendMessage(response);
+                    }
+                }
+
+                foreach (var running in RunningRequests)
+                {
+                    var message = running.Key;
+                    var startTime = running.Value;
+                    if (ReferenceEquals(message, this.Blocking)) continue;
+
+                    // Check how long they've been executing.
+                    var executionTime = now - startTime;
+                    if (executionTime >= slowRunningRequestDuration)
+                    {
+                        // Interleaving message X has been executing for a long time
+                        GetStatusList(ref diagnostics);
+                        var messageDiagnostics = new List<string>(diagnostics)
+                        {
+                            $"Interleaving message {message} has been executing for {executionTime}."
+                        };
+
+                        var response = messageFactory.CreateDiagnosticResponseMessage(message, isExecuting: true, isWaiting: false, messageDiagnostics);
+                        messageCenter.SendMessage(response);
+                    }
+                }
+
+                if (waiting is object)
+                {
+                    var queueLength = 1;
+                    foreach (var message in waiting)
+                    {
+                        var waitTime = now - message.QueuedTime;
+                        if (waitTime >= longQueueTimeDuration)
+                        {
+                            // Message X has been enqueued on the target grain for Y and is currently position QueueLength in queue for processing.
+                            GetStatusList(ref diagnostics); 
+                            var messageDiagnostics = new List<string>(diagnostics)
+                            {
+                               $"Message {message} has been enqueued on the target grain for {waitTime} and is currently position {queueLength} in queue for processing."
+                            };
+
+                            var response = messageFactory.CreateDiagnosticResponseMessage(message, isExecuting: false, isWaiting: true, messageDiagnostics);
+                            messageCenter.SendMessage(response);
+                        }
+
+                        queueLength++;
+                    }
+                }
+            }
+
+            void GetStatusList(ref List<string> diagnostics)
+            {
+                if (diagnostics is object) return;
+
+                diagnostics = new List<string>
+                {
+                    this.ToDetailedString(),
+                    $"TaskScheduler status: {this.WorkItemGroup.DumpStatus()}"
+                };
+            }
+        }
+
         public string DumpStatus()
         {
             var sb = new StringBuilder();
             lock (this)
             {
                 sb.AppendFormat("   {0}", ToDetailedString());
+
                 if (this.Blocking != null)
                 {
                     sb.AppendFormat("   Processing message: {0}", this.Blocking);
+                }
+
+                foreach (var msg in RunningRequests)
+                {
+                    if (ReferenceEquals(msg, this.Blocking)) continue;
+                    sb.AppendFormat("   Processing message: {0}", msg);
                 }
 
                 if (waiting!=null && waiting.Count > 0)
@@ -692,8 +750,8 @@ namespace Orleans.Runtime
         {
             return String.Format("[Activation: {0}{1}{2}{3} State={4}]",
                  Silo,
-                 Grain,
-                 ActivationId,
+                 this.GrainId,
+                 this.ActivationId,
                  GetActivationInfoString(),
                  State);
         }
@@ -702,16 +760,16 @@ namespace Orleans.Runtime
         {
             return
                 String.Format(
-                    "[Activation: {0}{1}{2}{3} State={4} NonReentrancyQueueSize={5} EnqueuedOnDispatcher={6} InFlightCount={7} NumRunning={8} IdlenessTimeSpan={9} CollectionAgeLimit={10}{11}]",
+                    "[Activation: {0}{1}{2} {3} State={4} NonReentrancyQueueSize={5} EnqueuedOnDispatcher={6} InFlightCount={7} NumRunning={8} IdlenessTimeSpan={9} CollectionAgeLimit={10}{11}]",
                     Silo.ToLongString(),
-                    Grain.ToDetailedString(),
-                    ActivationId,
+                    this.GrainId.ToString(),
+                    this.ActivationId,
                     GetActivationInfoString(),
                     State,                          // 4
                     WaitingCount,                   // 5 NonReentrancyQueueSize
                     EnqueuedOnDispatcherCount,      // 6 EnqueuedOnDispatcher
                     InFlightCount,                  // 7 InFlightCount
-                    numRunning,                     // 8 NumRunning
+                    RunningRequests.Count,          // 8 NumRunning
                     GetIdleness(DateTime.UtcNow),   // 9 IdlenessTimeSpan
                     CollectionAgeLimit,             // 10 CollectionAgeLimit
                     (includeExtraDetails && this.Blocking != null) ? " CurrentlyExecuting=" + this.Blocking : "");  // 11: Running
@@ -723,8 +781,8 @@ namespace Orleans.Runtime
             {
                 return String.Format("[Activation: {0}{1}{2}{3}]",
                      Silo,
-                     Grain,
-                     ActivationId,
+                     this.GrainId,
+                     this.ActivationId,
                      GetActivationInfoString());
             }
         }
@@ -742,15 +800,72 @@ namespace Orleans.Runtime
         private string GetActivationInfoString()
         {
             var placement = PlacedUsing != null ? PlacedUsing.GetType().Name : String.Empty;
-            return GrainInstanceType == null ? placement :
-                String.Format(" #GrainType={0} Placement={1}", GrainInstanceType.FullName, placement);
+            return GrainInstance is null ? placement : $"#GrainType={GrainInstance.GetType().FullName} Placement={placement}";
         }
 
-        public void Dispose()
+        public async ValueTask DisposeAsync()
         {
-            IDisposable disposable = serviceScope;
-            if (disposable != null) disposable.Dispose();
-            this.serviceScope = null;
+            var activator = this.GetComponent<IGrainActivator>();
+            if (activator != null)
+            {
+                await activator.DisposeInstance(this, this.GrainInstance);
+            } 
+
+            switch (this.serviceScope)
+            {
+                case IAsyncDisposable asyncDisposable:
+                    await asyncDisposable.DisposeAsync();
+                    break;
+                case IDisposable disposable:
+                    disposable.Dispose();
+                    break;
+            }
+        }
+
+        bool IEquatable<IGrainContext>.Equals(IGrainContext other) => ReferenceEquals(this, other);
+
+        public (TExtension, TExtensionInterface) GetOrSetExtension<TExtension, TExtensionInterface>(Func<TExtension> newExtensionFunc)
+            where TExtension : TExtensionInterface
+            where TExtensionInterface : IGrainExtension
+        {
+            TExtension implementation;
+            if (this.GetComponent<TExtensionInterface>() is object existing)
+            {
+                if (existing is TExtension typedResult)
+                {
+                    implementation = typedResult;
+                }
+                else
+                {
+                    throw new InvalidCastException($"Cannot cast existing extension of type {existing.GetType()} to target type {typeof(TExtension)}");
+                }
+            }
+            else
+            {
+                implementation = newExtensionFunc();
+                this.SetComponent<TExtensionInterface>(implementation);
+            }
+
+            var reference = this.GrainReference.Cast<TExtensionInterface>();
+            return (implementation, reference);
+        }
+
+        public TExtensionInterface GetExtension<TExtensionInterface>()
+            where TExtensionInterface : IGrainExtension
+        {
+            if (this.GetComponent<TExtensionInterface>() is TExtensionInterface result)
+            {
+                return result;
+            }
+
+            var implementation = this.ActivationServices.GetServiceByKey<Type, IGrainExtension>(typeof(TExtensionInterface));
+            if (!(implementation is TExtensionInterface typedResult))
+            {
+                throw new GrainExtensionNotInstalledException($"No extension of type {typeof(TExtensionInterface)} is installed on this instance and no implementations are registered for automated install");
+            }
+
+            this.SetComponent<TExtensionInterface>(typedResult);
+            return typedResult;
         }
     }
 

@@ -5,14 +5,14 @@ using System.Threading.Tasks;
 using System.Threading;
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Logging;
-using System.Net.Http.Headers;
+using Orleans.Internal;
 
 namespace Orleans.Runtime.MembershipService
 {
     /// <summary>
     /// Responsible for cleaning up dead membership table entries.
     /// </summary>
-    internal class MembershipTableCleanupAgent : ILifecycleParticipant<ISiloLifecycle>, IDisposable
+    internal class MembershipTableCleanupAgent : IHealthCheckParticipant, ILifecycleParticipant<ISiloLifecycle>, IDisposable
     {
         private readonly ClusterMembershipOptions clusterMembershipOptions;
         private readonly IMembershipTable membershipTableProvider;
@@ -43,7 +43,7 @@ namespace Orleans.Runtime.MembershipService
 
         private async Task CleanupDefunctSilos()
         {
-            if (this.clusterMembershipOptions.DefunctSiloCleanupPeriod == default)
+            if (!this.clusterMembershipOptions.DefunctSiloCleanupPeriod.HasValue)
             {
                 if (this.log.IsEnabled(LogLevel.Debug))
                 {
@@ -53,21 +53,30 @@ namespace Orleans.Runtime.MembershipService
                 return;
             }
 
-            var dateLimit = DateTime.UtcNow - this.clusterMembershipOptions.DefunctSiloExpiration;
             if (this.log.IsEnabled(LogLevel.Debug)) this.log.LogDebug("Starting membership table cleanup agent");
             try
             {
-                while (await this.cleanupDefunctSilosTimer.NextTick())
+                var random = new SafeRandom();
+                var period = this.clusterMembershipOptions.DefunctSiloCleanupPeriod.Value;
+
+                // The first cleanup should be scheduled for shortly after silo startup.
+                var delay = random.NextTimeSpan(TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(10));
+                while (await this.cleanupDefunctSilosTimer.NextTick(delay))
                 {
+                    // Select a random time within the next window.
+                    // The purpose of this is to add jitter to a process which could be affected by contention with other silos.
+                    delay = random.NextTimeSpan(period, period + TimeSpan.FromMinutes(5));
                     try
                     {
+                        var dateLimit = DateTime.UtcNow - this.clusterMembershipOptions.DefunctSiloExpiration;
                         await this.membershipTableProvider.CleanupDefunctSiloEntries(dateLimit);
                     }
                     catch (Exception exception) when (exception is NotImplementedException || exception is MissingMethodException)
                     {
-                        this.log.Error(
-                            ErrorCode.MembershipCleanDeadEntriesFailure,
-                            "DeleteDeadMembershipTableEntries operation is not supported by the current implementation of IMembershipTable. Disabling the timer now.");
+                        this.cleanupDefunctSilosTimer.Dispose();
+                        this.log.LogWarning(
+                            (int)ErrorCode.MembershipCleanDeadEntriesFailure,
+                            $"{nameof(IMembershipTable.CleanupDefunctSiloEntries)} operation is not supported by the current implementation of {nameof(IMembershipTable)}. Disabling the timer now.");
                         return;
                     }
                     catch (Exception exception)
@@ -98,6 +107,12 @@ namespace Orleans.Runtime.MembershipService
                 this.cleanupDefunctSilosTimer?.Dispose();
                 await Task.WhenAny(ct.WhenCancelled(), Task.WhenAll(tasks));
             }
+        }
+
+        bool IHealthCheckable.CheckHealth(DateTime lastCheckTime)
+        {
+            var ok = this.cleanupDefunctSilosTimer?.CheckHealth(lastCheckTime) ?? true;
+            return ok;
         }
     }
 }

@@ -1,9 +1,9 @@
+using System.Collections.Generic;
 using System.Threading.Tasks;
-using Orleans.Runtime.Utilities;
 
 namespace Orleans.Runtime
 {
-    internal interface IClusterMembershipService
+    public interface IClusterMembershipService
     {
         ClusterMembershipSnapshot CurrentSnapshot { get; }
 

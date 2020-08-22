@@ -7,7 +7,6 @@ using Orleans.Configuration;
 using Orleans.Hosting;
 using Orleans.Providers;
 using Orleans.Runtime;
-using Orleans.Runtime.Configuration;
 using Orleans.TestingHost;
 using TestExtensions;
 using Xunit;
@@ -35,9 +34,9 @@ namespace Tester.StreamingTests
                             .ConfigurePartitioning(partitionCount));
             }
 
-            private class MySiloBuilderConfigurator : ISiloBuilderConfigurator
+            private class MySiloBuilderConfigurator : ISiloConfigurator
             {
-                public void Configure(ISiloHostBuilder hostBuilder) =>
+                public void Configure(ISiloBuilder hostBuilder) =>
                     hostBuilder
                     .AddMemoryGrainStorage("PubSubStore")
                     .AddMemoryStreams<DefaultMemoryMessageBodySerializer>(

@@ -12,17 +12,14 @@ namespace Orleans.Runtime
         /// </summary>
         private static readonly TimeSpan TimerDelaySlack = TimeSpan.FromSeconds(3);
 
-        private readonly Task cancellationTask;
-        private readonly CancellationTokenSource cancellation;
+        private readonly CancellationTokenSource cancellation = new CancellationTokenSource();
         private readonly TimeSpan period;
         private readonly ILogger log;
         private DateTime lastFired = DateTime.MinValue;
-        private bool wasDelayed;
+        private DateTime? expected;
 
         public AsyncTimer(TimeSpan period, ILogger log)
         {
-            this.cancellation = new CancellationTokenSource();
-            this.cancellationTask = this.cancellation.Token.WhenCancelled();
             this.log = log;
             this.period = period;
         }
@@ -34,9 +31,9 @@ namespace Orleans.Runtime
         /// <returns><see langword="true"/> if the timer completed or <see langword="false"/> if the timer was cancelled</returns>
         public async Task<bool> NextTick(TimeSpan? overrideDelay = default)
         {
-            if (this.cancellationTask.IsCompleted) return false;
+            if (cancellation.IsCancellationRequested) return false;
 
-            var now = DateTime.UtcNow;
+            var start = DateTime.UtcNow;
             TimeSpan delay;
             if (overrideDelay.HasValue)
             {
@@ -50,40 +47,81 @@ namespace Orleans.Runtime
                 }
                 else
                 {
-                    delay = this.lastFired.Add(this.period).Subtract(now);
+                    delay = this.lastFired.Add(this.period).Subtract(start);
                 }
             }
 
             if (delay < TimeSpan.Zero) delay = TimeSpan.Zero;
 
+            var dueTime = start.Add(delay);
+            this.expected = dueTime;
             if (delay > TimeSpan.Zero)
             {
-                var resultTask = await Task.WhenAny(this.cancellationTask, Task.Delay(delay));
-                if (ReferenceEquals(resultTask, this.cancellationTask)) return false;
+                try
+                {
+                    // for backwards compatibility, support timers with periods up to ReminderRegistry.MaxSupportedTimeout
+                    var maxDelay = TimeSpan.FromMilliseconds(int.MaxValue);
+                    if (delay > maxDelay)
+                    {
+                        delay -= maxDelay;
+                        await Task.Delay(maxDelay, cancellation.Token).ConfigureAwait(false);
+                    }
+
+                    await Task.Delay(delay, cancellation.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    await Task.Yield();
+                    return false;
+                }
             }
 
-            var actual = this.lastFired = DateTime.UtcNow;
-            var dueTime = now.Add(delay);
-            var overshoot = actual.Subtract(dueTime).Duration();
-            this.wasDelayed = overshoot > TimerDelaySlack;
-            if (this.wasDelayed)
+            var now = this.lastFired = DateTime.UtcNow;
+            var overshoot = GetOvershootDelay(now, dueTime);
+            if (overshoot > TimeSpan.Zero)
             {
                 this.log?.LogWarning(
-                    "Timer should have fired at {Expected} but fired at {Actual}, which is {Overshoot} longer than expected",
+                    "Timer should have fired at {DueTime} but fired at {CurrentTime}, which is {Overshoot} longer than expected",
                     dueTime,
-                    actual,
+                    now,
                     overshoot);
             }
 
             return true;
         }
 
+        private static TimeSpan GetOvershootDelay(DateTime now, DateTime dueTime)
+        {
+            if (dueTime == DateTime.MinValue) return TimeSpan.Zero;
+            if (dueTime > now) return TimeSpan.Zero;
+
+            var overshoot = now.Subtract(dueTime);
+            if (overshoot > TimerDelaySlack) return overshoot;
+
+            return TimeSpan.Zero;
+        }
+
         public bool CheckHealth(DateTime lastCheckTime)
         {
-            if (this.lastFired > lastCheckTime) return !this.wasDelayed;
+            var now = DateTime.UtcNow;
+            var dueTime = this.expected.GetValueOrDefault();
+            var overshoot = GetOvershootDelay(now, dueTime);
+            if (overshoot > TimeSpan.Zero)
+            {
+                this.log?.LogWarning(
+                    "Timer should have fired at {DueTime}, which is {Overshoot} ago",
+                    dueTime,
+                    overshoot);
+                return false;
+            }
+
             return true;
         }
 
-        public void Dispose() => this.cancellation?.Cancel(throwOnFirstException: false);
+        public void Dispose()
+        {
+            this.expected = default;
+            this.cancellation.Cancel();
+        }
     }
 }

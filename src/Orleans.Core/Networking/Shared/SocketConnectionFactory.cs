@@ -6,6 +6,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.AspNetCore.Connections;
 using Microsoft.Extensions.Logging;
 using Orleans.Runtime;
 
@@ -27,7 +28,7 @@ namespace Orleans.Networking.Shared
 
         public async ValueTask<ConnectionContext> ConnectAsync(EndPoint endpoint, CancellationToken cancellationToken)
         {
-            var socket = new Socket(SocketType.Stream, ProtocolType.Tcp)
+            var socket = new Socket(endpoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp)
             {
                 LingerState = new LingerOption(true, 0),
                 NoDelay = true

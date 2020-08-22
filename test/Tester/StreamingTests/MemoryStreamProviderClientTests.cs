@@ -1,15 +1,12 @@
 
 using System;
-using System.Collections.Generic;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
 using Orleans;
 using Orleans.Configuration;
 using Orleans.Hosting;
 using Orleans.Providers;
-using Orleans.Providers.Streams.Generator;
 using Orleans.Runtime;
-using Orleans.Runtime.Configuration;
 using Orleans.TestingHost;
 using TestExtensions;
 using Xunit;
@@ -37,9 +34,9 @@ namespace Tester.StreamingTests
                     .ConfigurePartitioning(partitionCount));
             }
 
-            private class MySiloBuilderConfigurator : ISiloBuilderConfigurator
+            private class MySiloBuilderConfigurator : ISiloConfigurator
             {
-                public void Configure(ISiloHostBuilder hostBuilder)=> hostBuilder.AddMemoryGrainStorage("PubSubStore")
+                public void Configure(ISiloBuilder hostBuilder)=> hostBuilder.AddMemoryGrainStorage("PubSubStore")
                         .AddMemoryStreams<DefaultMemoryMessageBodySerializer>(StreamProviderName, b=>b
                     .ConfigurePartitioning(partitionCount))
                     .Configure<SiloMessagingOptions>(options => options.ClientDropTimeout = TimeSpan.FromSeconds(5));

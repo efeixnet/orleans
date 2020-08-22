@@ -12,15 +12,13 @@ using Microsoft.Extensions.Configuration;
 
 namespace TestVersionGrains
 {
-    public class VersionGrainsSiloBuilderConfigurator : ISiloBuilderConfigurator
+    public class VersionGrainsSiloBuilderConfigurator : ISiloConfigurator
     {
-        public void Configure(ISiloHostBuilder hostBuilder)
+        public void Configure(ISiloBuilder hostBuilder)
         {
             var cfg = hostBuilder.GetConfiguration();
             var siloCount = int.Parse(cfg["SiloCount"]);
-            var refreshInterval = TimeSpan.Parse(cfg["RefreshInterval"]);
             hostBuilder.Configure<SiloMessagingOptions>(options => options.AssumeHomogenousSilosForTesting = false);
-            hostBuilder.Configure<TypeManagementOptions>(options => options.TypeMapRefreshInterval = refreshInterval);
             hostBuilder.Configure<GrainVersioningOptions>(options =>
             {
                 options.DefaultCompatibilityStrategy = cfg["CompatibilityStrategy"];

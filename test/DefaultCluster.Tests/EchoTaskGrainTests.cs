@@ -1,8 +1,10 @@
 using System;
 using System.Diagnostics;
 using System.Threading.Tasks;
-using Orleans;
+using Microsoft.Extensions.DependencyInjection;
+using Orleans.Internal;
 using Orleans.Runtime;
+using Orleans.TestingHost;
 using TestExtensions;
 using UnitTests.GrainInterfaces;
 using Xunit;
@@ -267,7 +269,7 @@ namespace DefaultCluster.Tests.General
             Assert.Equal(expectedEcho, received); // CallMethodTask_Await
         }
 
-        [Fact, TestCategory("BVT"), TestCategory("Functional"), TestCategory("Echo")]
+        [Fact, TestCategory("BVT"), TestCategory("Echo")]
         public async Task EchoTaskGrain_Await_Reentrant()
         {
             IReentrantBlockingEchoTaskGrain g = this.GrainFactory.GetGrain<IReentrantBlockingEchoTaskGrain>(GetRandomGrainId());

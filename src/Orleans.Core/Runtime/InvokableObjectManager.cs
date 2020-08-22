@@ -13,40 +13,49 @@ namespace Orleans
     internal class InvokableObjectManager : IDisposable
     {
         private readonly CancellationTokenSource disposed = new CancellationTokenSource();
-        private readonly ConcurrentDictionary<GuidId, LocalObjectData> localObjects = new ConcurrentDictionary<GuidId, LocalObjectData>();
+        private readonly ConcurrentDictionary<ObserverGrainId, LocalObjectData> localObjects = new ConcurrentDictionary<ObserverGrainId, LocalObjectData>();
+        private readonly IGrainContext rootGrainContext;
         private readonly IRuntimeClient runtimeClient;
         private readonly ILogger logger;
         private readonly SerializationManager serializationManager;
+        private readonly MessagingTrace messagingTrace;
         private readonly Func<object, Task> dispatchFunc;
 
-        public InvokableObjectManager(IRuntimeClient runtimeClient, SerializationManager serializationManager, ILogger<InvokableObjectManager> logger)
+        public InvokableObjectManager(
+            IGrainContext rootGrainContext,
+            IRuntimeClient runtimeClient,
+            SerializationManager serializationManager,
+            MessagingTrace messagingTrace,
+            ILogger logger)
         {
+            this.rootGrainContext = rootGrainContext;
             this.runtimeClient = runtimeClient;
             this.serializationManager = serializationManager;
+            this.messagingTrace = messagingTrace;
             this.logger = logger;
 
             this.dispatchFunc = o =>
                 this.LocalObjectMessagePumpAsync((LocalObjectData) o);
         }
 
-        public bool TryRegister(IAddressable obj, GuidId objectId, IGrainMethodInvoker invoker)
+        public bool TryRegister(IAddressable obj, ObserverGrainId objectId, IGrainMethodInvoker invoker)
         {
-            return this.localObjects.TryAdd(objectId, new LocalObjectData(obj, objectId, invoker));
+            return this.localObjects.TryAdd(objectId, new LocalObjectData(obj, objectId, invoker, this.rootGrainContext));
         }
 
-        public bool TryDeregister(GuidId objectId)
+        public bool TryDeregister(ObserverGrainId objectId)
         {
-            return this.localObjects.TryRemove(objectId, out LocalObjectData ignored);
+            return this.localObjects.TryRemove(objectId, out _);
         }
 
         public void Dispatch(Message message)
         {
-            GuidId observerId = message.TargetObserverId;
-            if (observerId == null)
+            if (!ObserverGrainId.TryParse(message.TargetGrain, out var observerId))
             {
-                this.logger.Error(
-                    ErrorCode.ProxyClient_OGC_TargetNotFound_2,
-                    string.Format("Did not find TargetObserverId header in the message = {0}. A request message to a client is expected to have an observerId.", message));
+                this.logger.LogError(
+                    (int)ErrorCode.ProxyClient_OGC_TargetNotFound_2,
+                    "Message is not addresses to an observer. {Message}",
+                    message);
                 return;
             }
 
@@ -141,8 +150,11 @@ namespace Orleans
                         message = objectData.Messages.Dequeue();
                     }
 
-                    if (ExpireMessageIfExpired(message, MessagingStatisticsGroup.Phase.Invoke))
+                    if (message.IsExpired)
+                    {
+                        this.messagingTrace.OnDropExpiredMessage(message, MessagingStatisticsGroup.Phase.Invoke);
                         continue;
+                    }
 
                     RequestContextExtensions.Import(message.RequestContextData);
                     InvokeMethodRequest request = null;
@@ -172,7 +184,7 @@ namespace Orleans
 
                         // exceptions thrown within this scope are not considered to be thrown from user code
                         // and not from runtime code.
-                        var resultPromise = objectData.Invoker.Invoke(targetOb, request);
+                        var resultPromise = objectData.Invoker.Invoke(objectData, request);
                         if (resultPromise != null) // it will be null for one way messages
                         {
                             resultObject = await resultPromise;
@@ -201,22 +213,12 @@ namespace Orleans
             }
         }
 
-        private static bool ExpireMessageIfExpired(Message message, MessagingStatisticsGroup.Phase phase)
-        {
-            if (message.IsExpired)
-            {
-                message.DropExpiredMessage(phase);
-                return true;
-            }
-
-            return false;
-        }
-
         [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Design", "CA1031:DoNotCatchGeneralExceptionTypes")]
         private void SendResponseAsync(Message message, object resultObject)
         {
-            if (ExpireMessageIfExpired(message, MessagingStatisticsGroup.Phase.Respond))
+            if (message.IsExpired)
             {
+                this.messagingTrace.OnDropExpiredMessage(message, MessagingStatisticsGroup.Phase.Respond);
                 return;
             }
 
@@ -254,14 +256,14 @@ namespace Orleans
                         String.Format(
                             "Exception during invocation of notification method {0}, interface {1}. Ignoring exception because this is a one way request.",
                             request.MethodId,
-                            request.InterfaceId),
+                            request.InterfaceTypeCode),
                         exception);
                     break;
                 }
 
                 case Message.Directions.Request:
                 {
-                    Exception deepCopy = null;
+                    Exception deepCopy;
                     try
                     {
                         // we're expected to notify the caller if the deep copy failed.
@@ -286,22 +288,61 @@ namespace Orleans
             }
         }
 
-        public class LocalObjectData
+        public class LocalObjectData : IGrainContext
         {
-            internal WeakReference LocalObject { get; }
-            internal IGrainMethodInvoker Invoker { get; }
-            internal GuidId ObserverId { get; }
-            internal Queue<Message> Messages { get; }
-            internal bool Running { get; set; }
+            private readonly IGrainContext _rootGrainContext;
 
-            internal LocalObjectData(IAddressable obj, GuidId observerId, IGrainMethodInvoker invoker)
+            internal LocalObjectData(IAddressable obj, ObserverGrainId observerId, IGrainMethodInvoker invoker, IGrainContext rootGrainContext)
             {
                 this.LocalObject = new WeakReference(obj);
                 this.ObserverId = observerId;
                 this.Invoker = invoker;
                 this.Messages = new Queue<Message>();
                 this.Running = false;
+                _rootGrainContext = rootGrainContext;
             }
+
+            internal WeakReference LocalObject { get; }
+            internal IGrainMethodInvoker Invoker { get; }
+            internal ObserverGrainId ObserverId { get; }
+            internal Queue<Message> Messages { get; }
+            internal bool Running { get; set; }
+
+            GrainId IGrainContext.GrainId => this.ObserverId.GrainId;
+
+            GrainReference IGrainContext.GrainReference => (this.LocalObject.Target as IAddressable).AsReference();
+
+            IAddressable IGrainContext.GrainInstance => this.LocalObject.Target as IAddressable;
+
+            ActivationId IGrainContext.ActivationId => throw new NotImplementedException();
+
+            ActivationAddress IGrainContext.Address => throw new NotImplementedException();
+
+            IServiceProvider IGrainContext.ActivationServices => throw new NotSupportedException();
+
+            IGrainLifecycle IGrainContext.ObservableLifecycle => throw new NotImplementedException();
+
+            void IGrainContext.SetComponent<TComponent>(TComponent value)
+            {
+                if (this.LocalObject.Target is TComponent component)
+                {
+                    throw new ArgumentException("Cannot override a component which is implemented by this grain");
+                }
+
+                _rootGrainContext.SetComponent(value);
+            }
+
+            TComponent IGrainContext.GetComponent<TComponent>()
+            {
+                if (this.LocalObject.Target is TComponent component)
+                {
+                    return component;
+                }
+
+                return _rootGrainContext.GetComponent<TComponent>();
+            }
+
+            bool IEquatable<IGrainContext>.Equals(IGrainContext other) => ReferenceEquals(this, other);
         }
 
         public void Dispose()

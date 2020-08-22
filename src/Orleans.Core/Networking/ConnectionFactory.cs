@@ -1,10 +1,9 @@
 using System;
-using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.AspNetCore.Connections;
 using Microsoft.Extensions.Options;
 using Orleans.Configuration;
-using Orleans.Networking.Shared;
 
 namespace Orleans.Runtime.Messaging
 {
@@ -38,16 +37,18 @@ namespace Orleans.Runtime.Messaging
 
                     // Configure the connection builder using the user-defined options.
                     var connectionBuilder = new ConnectionBuilder(this.serviceProvider);
-                    this.ConnectionOptions.ConfigureConnectionBuilder(connectionBuilder);
+                    this.ConfigureConnectionBuilder(connectionBuilder);
                     Connection.ConfigureBuilder(connectionBuilder);
                     return this.connectionDelegate = connectionBuilder.Build();
                 }
             }
         }
 
+        protected virtual void ConfigureConnectionBuilder(IConnectionBuilder connectionBuilder) { }
+
         protected abstract Connection CreateConnection(SiloAddress address, ConnectionContext context);
 
-        public async ValueTask<Connection> ConnectAsync(SiloAddress address, CancellationToken cancellationToken)
+        public virtual async ValueTask<Connection> ConnectAsync(SiloAddress address, CancellationToken cancellationToken)
         {
             var connectionContext = await this.connectionFactory.ConnectAsync(address.Endpoint, cancellationToken);
             var connection = this.CreateConnection(address, connectionContext);

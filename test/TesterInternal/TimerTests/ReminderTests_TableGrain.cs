@@ -2,14 +2,12 @@
 
 using System;
 using System.Threading.Tasks;
-using Orleans;
-using Orleans.Runtime.Configuration;
 using Orleans.TestingHost;
 using TestExtensions;
 using UnitTests.GrainInterfaces;
 using Xunit;
-using Tester;
 using Orleans.Hosting;
+using Orleans.Internal;
 
 // ReSharper disable InconsistentNaming
 // ReSharper disable UnusedVariable
@@ -26,9 +24,9 @@ namespace UnitTests.TimerTests
                 builder.AddSiloBuilderConfigurator<SiloConfigurator>();
             }
 
-            private class SiloConfigurator : ISiloBuilderConfigurator
+            private class SiloConfigurator : ISiloConfigurator
             {
-                public void Configure(ISiloHostBuilder hostBuilder)
+                public void Configure(ISiloBuilder hostBuilder)
                 {
                     hostBuilder.UseInMemoryReminderService();
                 }

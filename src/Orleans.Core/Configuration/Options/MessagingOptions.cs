@@ -18,6 +18,7 @@ namespace Orleans.Configuration
             get { return Debugger.IsAttached ? ResponseTimeoutWithDebugger : responseTimeout; }
             set { this.responseTimeout = value; }
         }
+
         public static readonly TimeSpan DEFAULT_RESPONSE_TIMEOUT = TimeSpan.FromSeconds(30);
         private TimeSpan responseTimeout = DEFAULT_RESPONSE_TIMEOUT;
 
@@ -70,5 +71,20 @@ namespace Orleans.Configuration
         /// The maximum number of times a message send attempt will be retried.
         /// </summary>
         internal const int DEFAULT_MAX_MESSAGE_SEND_RETRIES = 1;
+
+        /// <summary>
+        /// The maximum size, in bytes, of the header for a message. The runtime will forcibly close the connection
+        /// if the header size is greater than this value.
+        /// </summary>
+        public int MaxMessageHeaderSize { get; set; } = DEFAULT_MAX_MESSAGE_HEADER_SIZE;
+        public const int DEFAULT_MAX_MESSAGE_HEADER_SIZE = 10485760; // 10MB
+
+        /// <summary>
+        /// The maximum size, in bytes, of the body for a message. The runtime will forcibly close the connection
+        /// if the body size is greater than this value.
+        /// </summary>
+        public int MaxMessageBodySize { get; set; } = DEFAULT_MAX_MESSAGE_BODY_SIZE;
+
+        public const int DEFAULT_MAX_MESSAGE_BODY_SIZE = 104857600; // 100MB
     }
 }

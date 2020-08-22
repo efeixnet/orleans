@@ -17,7 +17,7 @@ namespace Orleans.Runtime.MembershipService
             ILoggerFactory loggerFactory,
             ILogger<MembershipSystemTarget> log,
             IInternalGrainFactory grainFactory)
-            : base(Constants.MembershipOracleId, localSiloDetails.SiloAddress, loggerFactory)
+            : base(Constants.MembershipOracleType, localSiloDetails.SiloAddress, loggerFactory)
         {
             this.membershipTableManager = membershipTableManager;
             this.log = log;
@@ -33,22 +33,22 @@ namespace Orleans.Runtime.MembershipService
                 this.log.LogTrace("-Received GOSSIP SiloStatusChangeNotification about {Silo} status {Status}. Going to read the table.", updatedSilo, status);
             }
 
-            try
-            {
-                await this.membershipTableManager.Refresh();
-            }
-            catch (Exception exception)
-            {
-                this.log.LogError(
-                    (int)ErrorCode.MembershipGossipProcessingFailure,
-                    "Error refreshing membership table: {Exception}",
-                    exception);
-            }
+            await ReadTable();
         }
 
         public async Task MembershipChangeNotification(MembershipTableSnapshot snapshot)
         {
-            await this.membershipTableManager.RefreshFromSnapshot(snapshot);
+            if (snapshot.Version != MembershipVersion.MinValue)
+            {
+                await this.membershipTableManager.RefreshFromSnapshot(snapshot);
+            }
+            else
+            {
+                if (this.log.IsEnabled(LogLevel.Trace))
+                    this.log.LogTrace("-Received GOSSIP MembershipChangeNotification with MembershipVersion.MinValue. Going to read the table");
+
+                await ReadTable();
+            }
         }
 
         /// <summary>
@@ -66,7 +66,7 @@ namespace Orleans.Runtime.MembershipService
                 try
                 {
                     RequestContext.Set(RequestContext.PING_APPLICATION_HEADER, true);
-                    var remoteOracle = this.grainFactory.GetSystemTarget<IMembershipService>(Constants.MembershipOracleId, remoteSilo);
+                    var remoteOracle = this.grainFactory.GetSystemTarget<IMembershipService>(Constants.MembershipOracleType, remoteSilo);
                     task = remoteOracle.Ping(probeNumber);
 
                     // Update stats counter. Only count Pings that were successfuly sent, but not necessarily replied to.
@@ -120,7 +120,7 @@ namespace Orleans.Runtime.MembershipService
 
             try
             {
-                var remoteOracle = this.grainFactory.GetSystemTarget<IMembershipService>(Constants.MembershipOracleId, silo);
+                var remoteOracle = this.grainFactory.GetSystemTarget<IMembershipService>(Constants.MembershipOracleType, silo);
                 try
                 {
                     await remoteOracle.MembershipChangeNotification(snapshot);
@@ -136,6 +136,21 @@ namespace Orleans.Runtime.MembershipService
                 this.log.LogError(
                     (int)ErrorCode.MembershipGossipSendFailure,
                     "Exception while sending gossip notification to remote silo {Silo}: {Exception}", silo, exception);
+            }
+        }
+
+        private async Task ReadTable()
+        {
+            try
+            {
+                await this.membershipTableManager.Refresh();
+            }
+            catch (Exception exception)
+            {
+                this.log.LogError(
+                    (int)ErrorCode.MembershipGossipProcessingFailure,
+                    "Error refreshing membership table: {Exception}",
+                    exception);
             }
         }
     }

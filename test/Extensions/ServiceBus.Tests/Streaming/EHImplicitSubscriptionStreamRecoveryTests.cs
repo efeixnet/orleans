@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Configuration;
 using Orleans.Providers.Streams.Generator;
 using Orleans.Runtime;
 using Orleans.Streams;
@@ -12,7 +13,6 @@ using UnitTests.Grains;
 using Xunit;
 using Orleans.Hosting;
 using Orleans;
-using Microsoft.Extensions.Configuration;
 
 namespace ServiceBus.Tests.StreamingTests
 {
@@ -36,9 +36,9 @@ namespace ServiceBus.Tests.StreamingTests
                 builder.AddClientBuilderConfigurator<MyClientBuilderConfigurator>();
             }
 
-            private class MySiloBuilderConfigurator : ISiloBuilderConfigurator
+            private class MySiloBuilderConfigurator : ISiloConfigurator
             {
-                public void Configure(ISiloHostBuilder hostBuilder)
+                public void Configure(ISiloBuilder hostBuilder)
                 {
                     hostBuilder
                         .AddEventHubStreams(StreamProviderName, b=>

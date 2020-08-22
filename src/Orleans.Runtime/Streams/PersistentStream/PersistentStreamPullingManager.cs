@@ -8,6 +8,9 @@ using Orleans.Providers.Streams.Common;
 using Orleans.Runtime;
 using Orleans.Configuration;
 using RunState = Orleans.Configuration.StreamLifecycleOptions.RunState;
+using Orleans.Internal;
+using System.Threading;
+using System.Globalization;
 
 namespace Orleans.Streams
 {
@@ -32,18 +35,20 @@ namespace Orleans.Streams
         private readonly IQueueAdapterFactory adapterFactory;
         private RunState managerState;
         private IDisposable queuePrintTimer;
+        private int nextAgentId;
         private int NumberRunningAgents { get { return queuesToAgentsMap.Count; } }
 
         internal PersistentStreamPullingManager(
-            GrainId id, 
+            SystemTargetGrainId managerId,
             string strProviderName, 
             IStreamProviderRuntime runtime,
             IStreamPubSub streamPubSub,
             IQueueAdapterFactory adapterFactory,
             IStreamQueueBalancer streamQueueBalancer,
             StreamPullingAgentOptions options,
-            ILoggerFactory loggerFactory)
-            : base(id, runtime.ExecutingSiloAddress, loggerFactory)
+            ILoggerFactory loggerFactory,
+            SiloAddress siloAddress)
+            : base(managerId, siloAddress, lowPriority: false, loggerFactory)
         {
             if (string.IsNullOrWhiteSpace(strProviderName))
             {
@@ -74,7 +79,7 @@ namespace Orleans.Streams
             this.adapterFactory = adapterFactory;
 
             queueAdapterCache = adapterFactory.GetQueueAdapterCache();
-            logger = loggerFactory.CreateLogger($"{GetType().FullName}-{streamProviderName}");
+            logger = loggerFactory.CreateLogger($"{GetType().FullName}.{streamProviderName}");
             Log(ErrorCode.PersistentStreamPullingManager_01, "Created {0} for Stream Provider {1}.", GetType().Name, streamProviderName);
             this.loggerFactory = loggerFactory;
             IntValueStatistic.FindOrCreate(new StatisticName(StatisticNames.STREAMS_PERSISTENT_STREAM_NUM_PULLING_AGENTS, strProviderName), () => queuesToAgentsMap.Count);
@@ -106,7 +111,7 @@ namespace Orleans.Streams
                 queuePrintTimer.Dispose();
                 this.queuePrintTimer = null;
             }
-            (this.queueBalancer as IDisposable)?.Dispose();
+            await this.queueBalancer.Shutdown();
             this.queueBalancer = null; 
         }
 
@@ -211,12 +216,15 @@ namespace Orleans.Streams
             // First create them and store in local queuesToAgentsMap.
             // Only after that Initialize them all.
             var agents = new List<PersistentStreamPullingAgent>();
-            foreach (var queueId in myQueues.Where(queueId => !queuesToAgentsMap.ContainsKey(queueId)))
+            foreach (var queueId in myQueues)
             {
+                if (queuesToAgentsMap.ContainsKey(queueId))
+                    continue;
                 try
                 {
-                    var agentId = GrainId.NewSystemTargetGrainIdByTypeCode(Constants.PULLING_AGENT_SYSTEM_TARGET_TYPE_CODE);
-                    var agent = new PersistentStreamPullingAgent(agentId, streamProviderName, providerRuntime, this.loggerFactory, pubSub, queueId, this.options);
+                    var agentIdNumber = Interlocked.Increment(ref nextAgentId);
+                    var agentId = SystemTargetGrainId.Create(Constants.StreamPullingAgentType, this.Silo, $"{streamProviderName}_{agentIdNumber}_{queueId.ToStringWithHashCode()}");
+                    var agent = new PersistentStreamPullingAgent(agentId, streamProviderName, providerRuntime, this.loggerFactory, pubSub, queueId, this.options, this.Silo);
                     providerRuntime.RegisterSystemTarget(agent);
                     queuesToAgentsMap.Add(queueId, agent);
                     agents.Add(agent);

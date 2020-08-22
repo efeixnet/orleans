@@ -24,11 +24,11 @@ namespace Tester.ClientConnectionTests
             builder.AddClientBuilderConfigurator<ClientConfigurator>();
         }
 
-        public class SiloConfigurator : ISiloBuilderConfigurator
+        public class SiloConfigurator : ISiloConfigurator
         {
-            public void Configure(ISiloHostBuilder hostBuilder)
+            public void Configure(ISiloBuilder hostBuilder)
             {
-                hostBuilder.Configure<NetworkingOptions>(options => options.OpenConnectionTimeout = Timeout);
+                hostBuilder.Configure<ConnectionOptions>(options => options.OpenConnectionTimeout = Timeout);
             }
         }
 
